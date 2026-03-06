@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Floyd's TTY Bridge</title>
+  <link rel="stylesheet" href="lib/xterm.css">
+  <style>
+    /* ─── Design Tokens ─── */
+    :root {
+      --bg-primary: #0a0a0a;
+      --bg-secondary: #111111;
+      --bg-tertiary: #1a1a1a;
+      --border: #2a2a2a;
+      --text-primary: #e0e0e0;
+      --text-muted: #666666;
+      --accent-green: #00ff88;
+      --accent-pink: #ff3388;
+      --accent-blue: #3388ff;
+      --accent-yellow: #ffcc00;
+      --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      --radius-sm: 4px;
+      --radius-md: 6px;
+      --space-xs: 4px;
+      --space-sm: 8px;
+      --space-md: 12px;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      font-family: var(--font-ui);
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    /* ─── Status Bar (top) ─── */
+    #status-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: var(--space-xs) var(--space-sm);
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      min-height: 28px;
+      flex-shrink: 0;
+      user-select: none;
+      overflow: hidden;
+    }
+
+    #status-bar .status-left {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+    }
+
+    #status-bar .status-right {
+      display: flex;
+      align-items: center;
+      gap: var(--space-xs);
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      flex-shrink: 0;
+    }
+    .status-dot.connected { background: var(--accent-green); box-shadow: 0 0 4px var(--accent-green); }
+    .status-dot.error { background: var(--accent-pink); box-shadow: 0 0 4px var(--accent-pink); }
+    .status-dot.connecting { background: var(--accent-yellow); animation: pulse 1.5s ease-in-out infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    .status-label {
+      color: var(--text-muted);
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      font-size: 9px;
+      font-weight: 600;
+    }
+
+    .status-version {
+      color: var(--accent-green);
+      font-weight: bold;
+    }
+
+    /* ─── Terminal Container ─── */
+    #terminal-container {
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    /* Hide xterm scrollbar for cleaner look */
+    .xterm-viewport::-webkit-scrollbar { width: 4px; }
+    .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+    .xterm-viewport::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* ─── Tool Bar (bottom) ─── */
+    #tool-bar {
+      display: flex;
+      align-items: center;
+      gap: var(--space-xs);
+      padding: var(--space-xs) var(--space-sm);
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+      min-height: 28px;
+      overflow-x: auto;
+      overflow-y: hidden;
+    }
+
+    .tool-btn {
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .tool-btn:hover {
+      background: var(--border);
+      color: var(--text-primary);
+      border-color: #444;
+    }
+    .tool-btn:active { transform: scale(0.97); }
+    .tool-btn.active {
+      background: var(--accent-green);
+      color: var(--bg-primary);
+      border-color: var(--accent-green);
+    }
+    .tool-btn.live-active {
+      background: var(--accent-pink);
+      color: white;
+      border-color: var(--accent-pink);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    .tool-btn.media-active {
+      background: var(--accent-blue);
+      color: white;
+      border-color: var(--accent-blue);
+    }
+    .tool-btn.danger {
+      color: var(--accent-pink);
+    }
+    .tool-btn.danger:hover {
+      background: var(--accent-pink);
+      color: white;
+      border-color: var(--accent-pink);
+    }
+
+    .tool-spacer { flex: 1; }
+    .tool-divider {
+      width: 1px;
+      height: 16px;
+      background: var(--border);
+      margin: 0 2px;
+    }
+
+    /* ─── Settings Modal ─── */
+    #settings-modal {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.7);
+      z-index: 2000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(4px);
+    }
+    #settings-modal.visible { display: flex; }
+    .settings-panel {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: var(--space-md);
+      width: 90%;
+      max-width: 340px;
+    }
+    .settings-panel h3 {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--accent-green);
+      margin-bottom: var(--space-sm);
+    }
+    .settings-panel label {
+      font-size: 10px;
+      color: var(--text-muted);
+      display: block;
+      margin-bottom: var(--space-xs);
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .settings-panel input {
+      width: 100%;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 6px 8px;
+      border-radius: var(--radius-sm);
+      margin-bottom: var(--space-sm);
+    }
+    .settings-panel input:focus {
+      outline: none;
+      border-color: var(--accent-green);
+    }
+    .settings-panel .settings-actions {
+      display: flex;
+      gap: var(--space-xs);
+      justify-content: flex-end;
+      margin-top: var(--space-sm);
+    }
+
+    /* ─── Error Toast ─── */
+    #error-toast {
+      position: fixed;
+      top: 36px;
+      left: 8px;
+      right: 8px;
+      background: rgba(255, 51, 136, 0.95);
+      color: white;
+      padding: var(--space-sm) var(--space-md);
+      border-radius: var(--radius-md);
+      font-size: 11px;
+      font-family: var(--font-mono);
+      z-index: 1000;
+      display: none;
+      backdrop-filter: blur(8px);
+    }
+    #error-toast.visible { display: block; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="status-bar">
+      <div class="status-left">
+        <div class="status-dot" id="native-dot" title="Native host status"></div>
+        <span class="status-version">FLOYD TTY v4.2</span>
+        <span class="status-label" id="status-text">INITIALIZING</span>
+      </div>
+      <div class="status-right">
+        <span class="status-label" id="tab-info"></span>
+      </div>
+    </div>
+
+    <div id="terminal-container"></div>
+
+    <div id="tool-bar">
+      <button class="tool-btn" id="btn-analyze" title="Analyze current page (Cmd+Shift+L)">ANALYZE</button>
+      <button class="tool-btn" id="btn-dom" title="Get DOM tree">DOM</button>
+      <button class="tool-btn" id="btn-a11y" title="Accessibility audit">A11Y</button>
+      <button class="tool-btn" id="btn-screenshot" title="Capture screenshot">CAPTURE</button>
+      <div class="tool-divider"></div>
+      <button class="tool-btn" id="btn-live" title="Start/stop Gemini Live voice session">LIVE</button>
+      <button class="tool-btn" id="btn-screen" title="Share screen to Gemini Live">SCREEN</button>
+      <button class="tool-btn" id="btn-camera" title="Share camera to Gemini Live">CAM</button>
+      <div class="tool-spacer"></div>
+      <button class="tool-btn" id="btn-settings" title="API key settings">SET</button>
+      <button class="tool-btn" id="btn-reconnect" title="Reconnect native host">RECONNECT</button>
+    </div>
+  </div>
+
+  <div id="error-toast" role="alert"></div>
+
+  <!-- Settings Modal -->
+  <div id="settings-modal">
+    <div class="settings-panel">
+      <h3>Settings</h3>
+      <label for="input-api-key">Gemini API Key</label>
+      <input type="password" id="input-api-key" placeholder="AIzaSy..." autocomplete="off">
+      <label for="input-voice">Live Voice</label>
+      <input type="text" id="input-voice" placeholder="Puck" value="Puck">
+      <div class="settings-actions">
+        <button class="tool-btn" id="btn-settings-cancel">CANCEL</button>
+        <button class="tool-btn active" id="btn-settings-save">SAVE</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="lib/xterm.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>
