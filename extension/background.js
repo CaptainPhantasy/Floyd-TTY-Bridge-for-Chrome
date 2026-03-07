@@ -14,7 +14,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get(['gemini_api_key'], (data) => {
     if (!data.gemini_api_key) {
       // Pre-seed with the key from Tom's .env for convenience
-      chrome.storage.local.set({ gemini_api_key: 'AIzaSyD0hiLOO2LUSd2Z5HNMr5oNr1ekqsCOsVs' });
+      chrome.storage.local.set({ gemini_api_key: '**************************' });
     }
   });
 });
