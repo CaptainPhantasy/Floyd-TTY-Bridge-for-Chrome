@@ -171,8 +171,14 @@ async function handleNativeMessage(msg) {
 // ─── 4. Route Tool Calls to Content Script ──────────────────────────────────
 async function routeToolCall(msg) {
   try {
-    // Get active tab
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    // Get active tab in the last focused window, because currentWindow is undefined in service workers
+    let [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    
+    // Fallback if no window is technically "focused"
+    if (!tab) {
+      const tabs = await chrome.tabs.query({ active: true });
+      if (tabs.length > 0) tab = tabs[0];
+    }
     
     // Handle tools that need chrome.* APIs directly (can't run in content script)
     const browserApiResult = await handleBrowserApiTool(msg.tool, msg.args, tab);
@@ -181,7 +187,7 @@ async function routeToolCall(msg) {
     }
 
     if (!tab?.id) {
-      return { success: false, error: 'No active tab' };
+      return { success: false, error: 'No active tab found' };
     }
 
     // Send to content script and await response
@@ -376,7 +382,7 @@ chrome.commands.onCommand.addListener(async (command) => {
   }
 
   if (command === 'capture_context') {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     if (!tab?.id) return;
 
     // Run analyze_page in the active tab
@@ -402,7 +408,7 @@ chrome.commands.onCommand.addListener(async (command) => {
   }
 
   if (command === 'toggle_vision') {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     if (!tab?.id) return;
     chrome.tabs.sendMessage(tab.id, { type: 'toggle_vision_overlay' });
   }
