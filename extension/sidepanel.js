@@ -54,10 +54,7 @@ function initTerminal() {
   
   // Force a specific renderer path that is stable in Side Panels
   try {
-    // xterm.js compatibility: use .options or .setOption
-    if (term.setOption) {
-      term.setOption('rendererType', 'dom');
-    } else {
+    if (term.options) {
       term.options.rendererType = 'dom';
     }
   } catch (e) {
@@ -86,7 +83,6 @@ function connect() {
 
     port.onMessage.addListener((msg) => {
       if (msg.type === 'pty_output') {
-        // Direct write for maximum responsiveness and to prevent "lost" frames
         term.write(msg.data);
       } else if (msg.type === 'tool_response') {
         if (msg.requestId && pendingCallbacks.has(msg.requestId)) {
@@ -120,7 +116,6 @@ function handleSystemEvent(msg) {
     case 'native_connected':
       setStatus('connected', 'CONNECTED');
       term.writeln('\x1b[32;1m[Native Host Connected]\x1b[0m');
-      // Trigger a resize to sync dimensions immediately
       setTimeout(fitTerminal, 100);
       break;
     case 'context_captured':
@@ -135,9 +130,7 @@ function handleSystemEvent(msg) {
 term.onData((data) => {
   if (!port) return;
   
-  // Enterprise Hardening: Chunk large inputs (e.g., pastes) to prevent 
-  // Chrome Native Messaging IPC buffer overflows (Chrome limits to 1MB/msg, 
-  // but smaller is safer for the PTY).
+  // Enterprise Hardening: Chunk large inputs
   const CHUNK_SIZE = 8192; // 8KB chunks
   if (data.length <= CHUNK_SIZE) {
     try { port.postMessage({ type: 'pty_input', data }); } catch (e) {}
@@ -148,7 +141,6 @@ term.onData((data) => {
         const chunk = data.substring(offset, offset + CHUNK_SIZE);
         try { port.postMessage({ type: 'pty_input', data: chunk }); } catch (e) {}
         offset += CHUNK_SIZE;
-        // Yield to event loop to avoid locking the UI thread
         setTimeout(sendNextChunk, 0);
       }
     }
@@ -167,7 +159,6 @@ if (termContainer) {
 window.addEventListener('click', (e) => {
   const isInput = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable;
   const sideNav = document.getElementById('side-nav');
-  // Safe check: if sideNav exists, check if it contains the target. Otherwise, false.
   const isNav = sideNav ? sideNav.contains(e.target) : false;
   
   if (!isInput && !isNav) {
@@ -190,13 +181,12 @@ function fitTerminal() {
     const container = document.getElementById('terminal-container');
     if (!container || container.clientWidth === 0) return;
 
-    // Robust measurement ghost: safely access options
     const charMeasure = document.createElement('span');
     
     let fontFamily = '"SF Mono", monospace';
     let fontSize = 12;
 
-    if (term && term.options) {
+    if (term.options) {
       fontFamily = term.options.fontFamily || fontFamily;
       fontSize = term.options.fontSize || fontSize;
     }
@@ -365,7 +355,6 @@ document.getElementById('btn-screenshot')?.addEventListener('click', async () =>
 let liveSession = null;
 let audioStream = null;
 
-// Tool executor: routes Gemini's tool calls through the extension to the content script
 async function liveToolExecutor(toolName, args) {
   const result = await sendToolCall(toolName, args);
   if (result.success) {
@@ -374,31 +363,14 @@ async function liveToolExecutor(toolName, args) {
   throw new Error(result.error || 'Tool call failed');
 }
 
-async function getApiKey() {
-  return new Promise(resolve => {
-    chrome.storage.local.get(['gemini_api_key'], (data) => {
-      resolve(data.gemini_api_key || '');
-    });
-  });
-}
-
-async function getVoice() {
-  return new Promise(resolve => {
-    chrome.storage.local.get(['live_voice'], (data) => {
-      resolve(data.live_voice || 'Puck');
-    });
-  });
-}
-
 document.getElementById('btn-live')?.addEventListener('click', async () => {
   const btnLive = document.getElementById('btn-live');
 
   if (!LiveSession) {
-    showToast('Gemini Live not available — check console for errors');
+    showToast('Gemini Live not available');
     return;
   }
 
-  // If already live, disconnect
   if (liveSession && liveSession.getState() !== 'idle') {
     term.writeln('\x1b[1;33m[Disconnecting Gemini Live...]\x1b[0m');
     liveSession.disconnect();
@@ -414,9 +386,8 @@ document.getElementById('btn-live')?.addEventListener('click', async () => {
     return;
   }
 
-  // Check for API key
-  const apiKey = await getApiKey();
-  if (!apiKey) {
+  const data = await chrome.storage.local.get(['gemini_api_key', 'live_voice']);
+  if (!data.gemini_api_key) {
     showToast('Set your Gemini API key first (SET button)');
     document.getElementById('settings-modal').classList.add('visible');
     return;
@@ -427,35 +398,23 @@ document.getElementById('btn-live')?.addEventListener('click', async () => {
   btnLive.textContent = 'STOP';
 
   try {
-    // Get microphone
     audioStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
 
-    const voice = await getVoice();
-
     liveSession = new LiveSession(
-      // onMessage
-      (text) => {
-        term.writeln(`\x1b[1;36m[Tom]\x1b[0m ${text}`);
-      },
-      // onAudioData — audio plays internally, we just log activity
+      (text) => term.writeln(`\x1b[1;36m[Tom]\x1b[0m ${text}`),
       () => {},
-      // onError
       (error) => {
-        const msg = error.message || JSON.stringify(error);
-        term.writeln(`\x1b[1;31m[Live Error: ${msg}]\x1b[0m`);
+        term.writeln(`\x1b[1;31m[Live Error: ${error.message || JSON.stringify(error)}]\x1b[0m`);
         if (!error.retrying) {
           btnLive.classList.remove('live-active');
           btnLive.textContent = 'LIVE';
         }
       },
-      // onStatusChange
       (status) => {
-        const statusColors = {
-          idle: '90', connecting: '33', connected: '32', reconnecting: '33', disconnecting: '31'
-        };
-        term.writeln(`\x1b[${statusColors[status] || '0'}m[Live: ${status}]\x1b[0m`);
+        const colors = { idle: '90', connecting: '33', connected: '32', reconnecting: '33', disconnecting: '31' };
+        term.writeln(`\x1b[${colors[status] || '0'}m[Live: ${status}]\x1b[0m`);
         if (status === 'idle') {
           btnLive.classList.remove('live-active');
           btnLive.textContent = 'LIVE';
@@ -463,11 +422,10 @@ document.getElementById('btn-live')?.addEventListener('click', async () => {
           document.getElementById('btn-camera').classList.remove('media-active');
         }
       },
-      // toolExecutor — routes Gemini tool calls through the extension
       liveToolExecutor
     );
 
-    await liveSession.connect(audioStream, undefined, { voice });
+    await liveSession.connect(audioStream, undefined, { voice: data.live_voice || 'Puck' });
     term.writeln('\x1b[1;32m[Live session connected — speak to Tom]\x1b[0m');
   } catch (err) {
     term.writeln(`\x1b[1;31m[Failed to start live: ${err.message}]\x1b[0m`);
@@ -480,8 +438,6 @@ document.getElementById('btn-live')?.addEventListener('click', async () => {
   }
 });
 
-// ─── Screen Share / Camera ───
-
 document.getElementById('btn-screen')?.addEventListener('click', async () => {
   const btnScreen = document.getElementById('btn-screen');
 
@@ -490,7 +446,6 @@ document.getElementById('btn-screen')?.addEventListener('click', async () => {
     return;
   }
 
-  // Toggle off
   if (btnScreen.classList.contains('media-active')) {
     liveSession.stopVideoStream();
     btnScreen.classList.remove('media-active');
@@ -526,7 +481,6 @@ document.getElementById('btn-camera')?.addEventListener('click', async () => {
     return;
   }
 
-  // Toggle off
   if (btnCamera.classList.contains('media-active')) {
     liveSession.stopVideoStream();
     btnCamera.classList.remove('media-active');
@@ -561,7 +515,6 @@ document.getElementById('btn-settings')?.addEventListener('click', async () => {
   const keyInput = document.getElementById('input-api-key');
   const voiceInput = document.getElementById('input-voice');
 
-  // Load current values
   const data = await chrome.storage.local.get(['gemini_api_key', 'live_voice']);
   keyInput.value = data.gemini_api_key || '';
   voiceInput.value = data.live_voice || 'Puck';
@@ -583,7 +536,6 @@ document.getElementById('btn-settings-cancel')?.addEventListener('click', () => 
   document.getElementById('settings-modal').classList.remove('visible');
 });
 
-// Close modal on backdrop click
 document.getElementById('settings-modal')?.addEventListener('click', (e) => {
   if (e.target.id === 'settings-modal') {
     document.getElementById('settings-modal').classList.remove('visible');
@@ -600,7 +552,7 @@ document.getElementById('btn-reconnect')?.addEventListener('click', () => {
  * Boot Sequence
  */
 term.writeln('\x1b[1;32m╔══════════════════════════════════════════╗\x1b[0m');
-term.writeln('\x1b[1;32m║\x1b[0m  \x1b[1;37mFloyd\'s Labs TTY Bridge\x1b[0m \x1b[1;35mv4.5\x1b[0m            \x1b[1;32m║\x1b[0m');
+term.writeln('\x1b[1;32m║\x1b[0m  \x1b[1;37mFloyd\'s Labs TTY Bridge\x1b[0m \x1b[1;35mv4.6\x1b[0m            \x1b[1;32m║\x1b[0m');
 term.writeln('\x1b[1;32m╚══════════════════════════════════════════╝\x1b[0m');
 term.writeln('\x1b[90mReady for connection...\x1b[0m');
 
