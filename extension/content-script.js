@@ -1120,21 +1120,35 @@
   // Passive Context: DOM Mutation Streaming
   // =========================================================================
   let mutationTimeout = null;
+  let lastMutationEmit = Date.now();
+  
   const mutationObserver = new MutationObserver((mutations) => {
     if (mutationTimeout) clearTimeout(mutationTimeout);
+    
+    const now = Date.now();
+    const timeSinceLastEmit = now - lastMutationEmit;
+    
+    // Fire immediately if it's been more than 3 seconds since the last update
+    const delay = timeSinceLastEmit > 3000 ? 0 : 1000;
+    
     mutationTimeout = setTimeout(() => {
+      lastMutationEmit = Date.now();
       const snapshot = domSnapshot();
-      chrome.runtime.sendMessage({
-        type: 'system_event',
-        event: 'dom_mutation',
-        details: {
-          url: snapshot.url,
-          title: snapshot.title,
-          elementCount: snapshot.elementCount,
-          summary: `DOM settled after ${mutations.length} mutations.`
-        }
-      });
-    }, 1000); // 1s debounce
+      try {
+        chrome.runtime.sendMessage({
+          type: 'system_event',
+          event: 'dom_mutation',
+          details: {
+            url: snapshot.url,
+            title: snapshot.title,
+            elementCount: snapshot.elementCount,
+            summary: `DOM settled after mutations.`
+          }
+        });
+      } catch (e) {
+        // Extension context might be invalidated on reload
+      }
+    }, delay);
   });
 
   if (document.body) {

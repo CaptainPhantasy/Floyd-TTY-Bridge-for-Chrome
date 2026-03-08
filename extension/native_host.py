@@ -312,12 +312,18 @@ def chrome_to_pty(master_fd: int, msg: dict) -> None:
         else:
             osc_seq = f"{OSC_START}{OSC_RESPONSE_PREFIX}{serialized}{OSC_END}"
 
-        os.write(master_fd, osc_seq.encode("utf-8"))
+        try:
+            os.write(master_fd, osc_seq.encode("utf-8"))
+        except OSError:
+            pass # PTY closed or blocked
 
     elif msg_type == "pty_input":
         data = msg.get("data", "")
         if data:
-            os.write(master_fd, data.encode("utf-8"))
+            try:
+                os.write(master_fd, data.encode("utf-8"))
+            except OSError:
+                pass # PTY closed or blocked
 
     elif msg_type == "execute_shell":
         request_id = msg.get("requestId")

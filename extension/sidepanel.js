@@ -133,8 +133,26 @@ function handleSystemEvent(msg) {
  * Input & Focus Handling
  */
 term.onData((data) => {
-  if (port) {
-    port.postMessage({ type: 'pty_input', data });
+  if (!port) return;
+  
+  // Enterprise Hardening: Chunk large inputs (e.g., pastes) to prevent 
+  // Chrome Native Messaging IPC buffer overflows (Chrome limits to 1MB/msg, 
+  // but smaller is safer for the PTY).
+  const CHUNK_SIZE = 8192; // 8KB chunks
+  if (data.length <= CHUNK_SIZE) {
+    try { port.postMessage({ type: 'pty_input', data }); } catch (e) {}
+  } else {
+    let offset = 0;
+    function sendNextChunk() {
+      if (offset < data.length && port) {
+        const chunk = data.substring(offset, offset + CHUNK_SIZE);
+        try { port.postMessage({ type: 'pty_input', data: chunk }); } catch (e) {}
+        offset += CHUNK_SIZE;
+        // Yield to event loop to avoid locking the UI thread
+        setTimeout(sendNextChunk, 0);
+      }
+    }
+    sendNextChunk();
   }
 });
 
@@ -172,16 +190,13 @@ function fitTerminal() {
     const container = document.getElementById('terminal-container');
     if (!container || container.clientWidth === 0) return;
 
-    // Robust measurement ghost: handles both old (term.getOption) and new (term.options) xterm.js APIs
+    // Robust measurement ghost: safely access options
     const charMeasure = document.createElement('span');
     
     let fontFamily = '"SF Mono", monospace';
     let fontSize = 12;
 
-    if (typeof term.getOption === 'function') {
-      fontFamily = term.getOption('fontFamily') || fontFamily;
-      fontSize = term.getOption('fontSize') || fontSize;
-    } else if (term.options) {
+    if (term && term.options) {
       fontFamily = term.options.fontFamily || fontFamily;
       fontSize = term.options.fontSize || fontSize;
     }

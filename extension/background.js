@@ -328,49 +328,59 @@ chrome.runtime.onConnect.addListener((port) => {
 
 // ─── 7. Handle Messages from Content Script (delegated browser API calls) ───
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // 1. Content script delegating a browser API call
-  if (message.action) {
-    handleBrowserApiTool(message.action, message, { id: sender.tab?.id })
-      .then(result => {
-        sendResponse(result || { success: false, error: 'Unknown action' });
-      })
-      .catch(err => {
-        sendResponse({ success: false, error: err.message });
-      });
-    return true; // Keep channel open for async
-  }
+  if (!message || typeof message !== 'object') return false;
 
-  // 2. Interceptor events (console.error, network failures)
-  if (message.type === 'interceptor_event') {
-    if (nativePort) {
-      // Format as red text for the agent terminal
-      const { payload } = message;
-      let text = `\r\n\x1b[31;1m[BROWSER ERROR]\x1b[0m `;
-      if (payload.type === 'console_error') {
-        text += `Console: ${payload.message}`;
-      } else if (payload.type === 'network_error') {
-        text += `Network: ${payload.method} ${payload.url} (${payload.status || payload.error})`;
-      } else if (payload.type === 'unhandled_exception') {
-        text += `Exception: ${payload.message} at ${payload.filename}:${payload.lineno}`;
-      } else if (payload.type === 'unhandled_rejection') {
-        text += `Promise Rejection: ${payload.reason}`;
+  try {
+    // 1. Content script delegating a browser API call
+    if (message.action) {
+      handleBrowserApiTool(message.action, message, { id: sender.tab?.id })
+        .then(result => {
+          sendResponse(result || { success: false, error: 'Unknown action' });
+        })
+        .catch(err => {
+          sendResponse({ success: false, error: err.message || 'Internal error' });
+        });
+      return true; // Keep channel open for async
+    }
+
+    // 2. Interceptor events (console.error, network failures)
+    if (message.type === 'interceptor_event') {
+      if (nativePort && message.payload) {
+        // Format as red text for the agent terminal
+        const { payload } = message;
+        let text = `\r\n\x1b[31;1m[BROWSER ERROR]\x1b[0m `;
+        if (payload.type === 'console_error') {
+          text += `Console: ${payload.message}`;
+        } else if (payload.type === 'network_error') {
+          text += `Network: ${payload.method} ${payload.url} (${payload.status || payload.error})`;
+        } else if (payload.type === 'unhandled_exception') {
+          text += `Exception: ${payload.message} at ${payload.filename}:${payload.lineno}`;
+        } else if (payload.type === 'unhandled_rejection') {
+          text += `Promise Rejection: ${payload.reason}`;
+        }
+        text += '\r\n';
+        
+        // Inject directly into the terminal stream for the agent to see
+        nativePort.postMessage({ type: 'pty_input', data: text });
       }
-      text += '\r\n';
-      
-      // Inject directly into the terminal stream for the agent to see
-      nativePort.postMessage({ type: 'pty_input', data: text });
+      return false;
     }
-  }
 
-  // 3. System events (DOM mutations, etc.)
-  if (message.type === 'system_event') {
-    if (nativePort) {
-      const osc = `\x1b]7701;${JSON.stringify({ type: 'system_event', ...message })}\x07`;
-      nativePort.postMessage({ type: 'pty_input', data: osc });
+    // 3. System events (DOM mutations, etc.)
+    if (message.type === 'system_event') {
+      if (nativePort) {
+        const osc = `\x1b]7701;${JSON.stringify({ type: 'system_event', ...message })}\x07`;
+        nativePort.postMessage({ type: 'pty_input', data: osc });
+      }
+      // Also notify panel
+      if (panelPort) panelPort.postMessage(message);
+      return false;
     }
-    // Also notify panel
-    if (panelPort) panelPort.postMessage(message);
+  } catch (error) {
+    console.error('[Floyd] Error handling message:', error);
   }
+  
+  return false;
 });
 
 // ─── 8. Keyboard Shortcuts ──────────────────────────────────────────────────
