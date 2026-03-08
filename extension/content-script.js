@@ -172,13 +172,20 @@
   /** Delegate an action to the background service worker. */
   function delegateToBackground(action, data) {
     return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ action, ...data }, response => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-        } else {
-          resolve(response);
+      try {
+        if (!chrome.runtime || !chrome.runtime.id) {
+          throw new Error('Extension context invalidated.');
         }
-      });
+        chrome.runtime.sendMessage({ action, ...data }, response => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else {
+            resolve(response);
+          }
+        });
+      } catch (e) {
+        reject(e);
+      }
     });
   }
 
@@ -1135,16 +1142,18 @@
       lastMutationEmit = Date.now();
       const snapshot = domSnapshot();
       try {
-        chrome.runtime.sendMessage({
-          type: 'system_event',
-          event: 'dom_mutation',
-          details: {
-            url: snapshot.url,
-            title: snapshot.title,
-            elementCount: snapshot.elementCount,
-            summary: `DOM settled after mutations.`
-          }
-        });
+        if (chrome.runtime && chrome.runtime.id) {
+          chrome.runtime.sendMessage({
+            type: 'system_event',
+            event: 'dom_mutation',
+            details: {
+              url: snapshot.url,
+              title: snapshot.title,
+              elementCount: snapshot.elementCount,
+              summary: `DOM settled after mutations.`
+            }
+          });
+        }
       } catch (e) {
         // Extension context might be invalidated on reload
       }
@@ -1182,10 +1191,16 @@
     const payload = event.data.data;
 
     // Pipe to terminal via background -> native host
-    chrome.runtime.sendMessage({
-      type: 'interceptor_event',
-      payload
-    });
+    try {
+      if (chrome.runtime && chrome.runtime.id) {
+        chrome.runtime.sendMessage({
+          type: 'interceptor_event',
+          payload
+        });
+      }
+    } catch (e) {
+      // Extension context invalidated — fail silently
+    }
   });
 
   injectInterceptors();
