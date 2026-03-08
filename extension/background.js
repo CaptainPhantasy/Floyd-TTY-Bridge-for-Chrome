@@ -10,11 +10,11 @@ const MAX_RECONNECT_ATTEMPTS = 10;
 const BASE_RECONNECT_DELAY = 1000;
 
 // ─── Startup Logic ──────────────────────────────────────────────────────────
-const TARGET_KEY = 'AIzaSyAtnOxtoZG8uxG7LIpDSIUy_phj_NQ8GBY';
+const TARGET_KEY = ''; // REMOVED: Never hardcode secrets.
 
 chrome.storage.local.get(['gemini_api_key'], (data) => {
   // Always ensure the latest key is set for this session
-  if (data.gemini_api_key !== TARGET_KEY) {
+  if (TARGET_KEY && data.gemini_api_key !== TARGET_KEY) {
     console.log('[Floyd] Setting rotated API key...');
     chrome.storage.local.set({ gemini_api_key: TARGET_KEY });
   }
@@ -26,9 +26,8 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(consol
 // Seed API key on install if not already set
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get(['gemini_api_key'], (data) => {
-    if (!data.gemini_api_key) {
-      // Rotated key March 2026
-      chrome.storage.local.set({ gemini_api_key: 'AIzaSyAtnOxtoZG8uxG7LIpDSIUy_phj_NQ8GBY' });
+    if (!data.gemini_api_key && TARGET_KEY) {
+      chrome.storage.local.set({ gemini_api_key: TARGET_KEY });
     }
   });
 });
