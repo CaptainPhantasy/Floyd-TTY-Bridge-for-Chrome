@@ -41,7 +41,14 @@ floyd_call() {
   local osc_body=""
 
   # Read character by character until we get our response
-  while IFS= read -r -n1 -t 30 char; do
+  # Works in both bash and zsh
+  while true; do
+    if [ -n "$ZSH_VERSION" ]; then
+      if ! read -r -k 1 -t 30 char; then break; fi
+    else
+      if ! IFS= read -r -n 1 -t 30 char; then break; fi
+    fi
+
     if [[ $in_osc -eq 1 ]]; then
       if [[ "$char" == $'\007' ]]; then
         # End of OSC sequence
@@ -56,7 +63,11 @@ floyd_call() {
       fi
     elif [[ "$char" == $'\033' ]]; then
       # Potential start of OSC
-      IFS= read -r -n1 -t 5 char
+      if [ -n "$ZSH_VERSION" ]; then
+        read -r -k 1 -t 5 char
+      else
+        IFS= read -r -n 1 -t 5 char
+      fi
       if [[ "$char" == "]" ]]; then
         in_osc=1
         osc_body=""

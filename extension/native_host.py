@@ -43,6 +43,47 @@ OSC_COMMAND_PREFIX = "7701;"
 OSC_RESPONSE_PREFIX = "7702;"
 
 # ---------------------------------------------------------------------------
+# Process Supervisor — manages background and orphaned processes
+# ---------------------------------------------------------------------------
+
+class ProcessSupervisor:
+    """
+    Tracks and manages child processes to prevent zombies and hangs.
+    """
+    def __init__(self):
+        self._processes: dict[int, subprocess.Popen] = {}
+        self._lock = threading.Lock()
+
+    def add_process(self, proc: subprocess.Popen):
+        with self._lock:
+            self._processes[proc.pid] = proc
+
+    def check_zombies(self):
+        """Reaps finished processes."""
+        with self._lock:
+            finished = []
+            for pid, proc in self._processes.items():
+                if proc.poll() is not None:
+                    finished.append(pid)
+            for pid in finished:
+                del self._processes[pid]
+
+    def terminate_all(self):
+        """Kill everything on shutdown."""
+        with self._lock:
+            for pid, proc in self._processes.items():
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            self._processes.clear()
+
+supervisor = ProcessSupervisor()
+
+# ---------------------------------------------------------------------------
 # Chrome native messaging I/O (stdin/stdout are the Chrome channel)
 # ---------------------------------------------------------------------------
 
@@ -56,17 +97,29 @@ def send_message(msg: dict) -> None:
 
 
 def read_message() -> Optional[dict]:
-    """Read a length-prefixed JSON message from stdin. Returns None on EOF."""
-    raw_length = sys.stdin.buffer.read(4)
-    if len(raw_length) < 4:
+    """Read a length-prefixed JSON message from stdin. Returns None on EOF or blocking."""
+    try:
+        # Check if stdin has data waiting (timeout 0.1s) to prevent blocking
+        ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+        if not ready:
+            return {} # Return empty dict to signify 'no message yet' instead of None (EOF)
+
+        raw_length = sys.stdin.buffer.read(4)
+        if len(raw_length) < 4:
+            return None # EOF
+        length = struct.unpack("I", raw_length)[0]
+        if length == 0:
+            return {}
+        
+        # Read the exact payload
+        data = sys.stdin.buffer.read(length)
+        if len(data) < length:
+            return None # EOF or broken pipe
+            
+        return json.loads(data.decode("utf-8"))
+    except Exception as e:
+        # Log to file or ignore
         return None
-    length = struct.unpack("I", raw_length)[0]
-    if length == 0:
-        return {}
-    data = sys.stdin.buffer.read(length)
-    if len(data) < length:
-        return None
-    return json.loads(data.decode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +276,7 @@ def chrome_to_pty(master_fd: int, msg: dict) -> None:
       - tool_response: format as OSC 7702 and write to PTY.
         If the serialized result exceeds 16 KB, write to a temp file instead.
       - pty_input: write raw keystrokes / text to the PTY.
+      - execute_shell: run a command silently and return result via messaging.
     """
     msg_type = msg.get("type", "")
 
@@ -265,6 +319,48 @@ def chrome_to_pty(master_fd: int, msg: dict) -> None:
         if data:
             os.write(master_fd, data.encode("utf-8"))
 
+    elif msg_type == "execute_shell":
+        request_id = msg.get("requestId")
+        command = msg.get("command")
+        
+        def run_shell():
+            try:
+                proc = subprocess.Popen(
+                    ["/bin/bash", "-c", command],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    preexec_fn=os.setsid
+                )
+                supervisor.add_process(proc)
+                stdout, stderr = proc.communicate(timeout=30)
+                send_message({
+                    "type": "tool_response",
+                    "requestId": request_id,
+                    "success": proc.returncode == 0,
+                    "result": {
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "exitCode": proc.returncode
+                    }
+                })
+            except subprocess.TimeoutExpired:
+                send_message({
+                    "type": "tool_response",
+                    "requestId": request_id,
+                    "success": False,
+                    "error": "Command timed out after 30s"
+                })
+            except Exception as e:
+                send_message({
+                    "type": "tool_response",
+                    "requestId": request_id,
+                    "success": False,
+                    "error": str(e)
+                })
+
+        threading.Thread(target=run_shell, daemon=True).start()
+
     elif msg_type == "resize":
         # Optional: handle terminal resize
         rows = msg.get("rows", 24)
@@ -301,6 +397,9 @@ def cleanup(child_pid: Optional[int] = None) -> None:
             os.killpg(os.getpgid(child_pid), signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
+
+    # Terminate background processes
+    supervisor.terminate_all()
 
     # Clean up temp directory
     if os.path.isdir(TEMP_DIR):
@@ -372,6 +471,7 @@ def main() -> None:
     # Overlay Floyd-specific vars
     env["TERM"] = "xterm-256color"
     env["COLORTERM"] = "truecolor"
+    env["LANG"] = "en_US.UTF-8"
     env["FLOYD_TTY_BRIDGE"] = "4.0"
     env["FLOYD_TOOLS_AVAILABLE"] = "1"
     env["FLOYD_TOOLS_SDK"] = "/usr/local/share/floyd/floyd-tools.sh"
@@ -418,14 +518,24 @@ def main() -> None:
     )
     reader_thread.start()
 
+    # Watchdog thread: reaps finished background processes
+    def watchdog():
+        while not shutdown_event.is_set():
+            supervisor.check_zombies()
+            time.sleep(5)
+    
+    threading.Thread(target=watchdog, daemon=True).start()
+
     # Main loop: read messages from Chrome, dispatch to PTY
     try:
         while True:
             msg = read_message()
             if msg is None:
-                # Chrome disconnected
+                # Chrome disconnected (EOF)
                 break
-            chrome_to_pty(master_fd, msg)
+            
+            if msg: # Only process if not an empty dict (which means no data ready)
+                chrome_to_pty(master_fd, msg)
 
             # Check if child is still alive
             if child.poll() is not None:

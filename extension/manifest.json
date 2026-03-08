@@ -84,7 +84,7 @@
 
   "web_accessible_resources": [
     {
-      "resources": ["lib/*", "audio/*"],
+      "resources": ["lib/*", "audio/*", "interceptors-main.js"],
       "matches": ["<all_urls>"]
     }
   ]

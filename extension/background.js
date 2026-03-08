@@ -5,6 +5,20 @@
 let nativePort = null;
 let panelPort = null;
 let offscreenReady = false;
+let reconnectAttempt = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const BASE_RECONNECT_DELAY = 1000;
+
+// ─── Startup Logic ──────────────────────────────────────────────────────────
+const TARGET_KEY = 'AIzaSyAtnOxtoZG8uxG7LIpDSIUy_phj_NQ8GBY';
+
+chrome.storage.local.get(['gemini_api_key'], (data) => {
+  // Always ensure the latest key is set for this session
+  if (data.gemini_api_key !== TARGET_KEY) {
+    console.log('[Floyd] Setting rotated API key...');
+    chrome.storage.local.set({ gemini_api_key: TARGET_KEY });
+  }
+});
 
 // ─── 1. Side Panel Setup ────────────────────────────────────────────────────
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
@@ -13,8 +27,8 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(consol
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get(['gemini_api_key'], (data) => {
     if (!data.gemini_api_key) {
-      // Pre-seed with the key from Tom's .env for convenience
-      chrome.storage.local.set({ gemini_api_key: '**************************' });
+      // Rotated key March 2026
+      chrome.storage.local.set({ gemini_api_key: 'AIzaSyAtnOxtoZG8uxG7LIpDSIUy_phj_NQ8GBY' });
     }
   });
 });
@@ -22,7 +36,7 @@ chrome.runtime.onInstalled.addListener(() => {
 // ─── 2. Native Messaging Connection ─────────────────────────────────────────
 async function connectNative() {
   if (nativePort) return; // Already connected
-  console.log('[Floyd] connectNative called');
+  console.log('[Floyd] connectNative called, attempt:', reconnectAttempt);
 
   // Permission-gated connection (pattern from Claude extension)
   const hasPermission = await chrome.permissions.contains({ permissions: ['nativeMessaging'] });
@@ -50,6 +64,7 @@ async function connectNative() {
       nativePort = null;
       // Stop keep-alive alarm
       chrome.alarms.clear('floyd-keep-alive');
+      
       // Notify side panel
       if (panelPort) {
         panelPort.postMessage({
@@ -58,11 +73,20 @@ async function connectNative() {
           error: error?.message
         });
       }
-      // Desktop notification if panel not open
-      if (!panelPort) {
-        notifyUser('Floyd TTY Bridge', 'Native host disconnected: ' + (error?.message || 'unknown'));
+
+      // Auto-reconnect logic with exponential backoff
+      if (reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
+        const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempt), 30000);
+        reconnectAttempt++;
+        console.log(`[Floyd] Retrying native connection in ${delay}ms...`);
+        setTimeout(connectNative, delay);
+      } else {
+        notifyUser('Floyd TTY Bridge', 'Native host disconnected: Permanent failure after max retries.');
       }
     });
+
+    // Reset reconnection count on success
+    reconnectAttempt = 0;
 
     // Start keep-alive alarm to prevent service worker termination
     chrome.alarms.create('floyd-keep-alive', { periodInMinutes: 0.4 });
@@ -149,14 +173,15 @@ async function routeToolCall(msg) {
   try {
     // Get active tab
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) {
-      return { success: false, error: 'No active tab' };
-    }
-
+    
     // Handle tools that need chrome.* APIs directly (can't run in content script)
     const browserApiResult = await handleBrowserApiTool(msg.tool, msg.args, tab);
     if (browserApiResult !== null) {
       return browserApiResult;
+    }
+
+    if (!tab?.id) {
+      return { success: false, error: 'No active tab' };
     }
 
     // Send to content script and await response
@@ -225,12 +250,32 @@ async function handleBrowserApiTool(tool, args, activeTab) {
       return { success: true, result: { screenshot: dataUrl, format: 'png' } };
     }
     case 'get_tab_state': {
-      const tabId = args.tab_id || activeTab.id;
+      const tabId = args.tab_id || activeTab?.id;
+      if (!tabId) return { success: false, error: 'No tab ID' };
       const tab = await chrome.tabs.get(tabId);
       return { success: true, result: {
         tabId: tab.id, url: tab.url, title: tab.title,
         status: tab.status, active: tab.active
       }};
+    }
+    case 'execute_local_shell': {
+      // Forward this to native host to execute
+      if (!nativePort) return { success: false, error: 'Native host not connected' };
+      return new Promise((resolve) => {
+        const requestId = 'shell_' + Date.now();
+        const listener = (msg) => {
+          if (msg.type === 'tool_response' && msg.requestId === requestId) {
+            nativePort.onMessage.removeListener(listener);
+            resolve(msg);
+          }
+        };
+        nativePort.onMessage.addListener(listener);
+        nativePort.postMessage({
+          type: 'execute_shell',
+          requestId,
+          command: args.command
+        });
+      });
     }
     default:
       return null; // Not a browser API tool — route to content script
@@ -278,7 +323,7 @@ chrome.runtime.onConnect.addListener((port) => {
 
 // ─── 7. Handle Messages from Content Script (delegated browser API calls) ───
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Content script delegating a browser API call
+  // 1. Content script delegating a browser API call
   if (message.action) {
     handleBrowserApiTool(message.action, message, { id: sender.tab?.id })
       .then(result => {
@@ -288,6 +333,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: false, error: err.message });
       });
     return true; // Keep channel open for async
+  }
+
+  // 2. Interceptor events (console.error, network failures)
+  if (message.type === 'interceptor_event') {
+    if (nativePort) {
+      // Format as red text for the agent terminal
+      const { payload } = message;
+      let text = `\r\n\x1b[31;1m[BROWSER ERROR]\x1b[0m `;
+      if (payload.type === 'console_error') {
+        text += `Console: ${payload.message}`;
+      } else if (payload.type === 'network_error') {
+        text += `Network: ${payload.method} ${payload.url} (${payload.status || payload.error})`;
+      } else if (payload.type === 'unhandled_exception') {
+        text += `Exception: ${payload.message} at ${payload.filename}:${payload.lineno}`;
+      } else if (payload.type === 'unhandled_rejection') {
+        text += `Promise Rejection: ${payload.reason}`;
+      }
+      text += '\r\n';
+      
+      // Inject directly into the terminal stream for the agent to see
+      nativePort.postMessage({ type: 'pty_input', data: text });
+    }
+  }
+
+  // 3. System events (DOM mutations, etc.)
+  if (message.type === 'system_event') {
+    if (nativePort) {
+      const osc = `\x1b]7701;${JSON.stringify({ type: 'system_event', ...message })}\x07`;
+      nativePort.postMessage({ type: 'pty_input', data: osc });
+    }
+    // Also notify panel
+    if (panelPort) panelPort.postMessage(message);
   }
 });
 

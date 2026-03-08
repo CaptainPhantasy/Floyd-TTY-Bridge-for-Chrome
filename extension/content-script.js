@@ -1117,10 +1117,141 @@
   }
 
   // =========================================================================
+  // Passive Context: DOM Mutation Streaming
+  // =========================================================================
+  let mutationTimeout = null;
+  const mutationObserver = new MutationObserver((mutations) => {
+    if (mutationTimeout) clearTimeout(mutationTimeout);
+    mutationTimeout = setTimeout(() => {
+      const snapshot = domSnapshot();
+      chrome.runtime.sendMessage({
+        type: 'system_event',
+        event: 'dom_mutation',
+        details: {
+          url: snapshot.url,
+          title: snapshot.title,
+          elementCount: snapshot.elementCount,
+          summary: `DOM settled after ${mutations.length} mutations.`
+        }
+      });
+    }, 1000); // 1s debounce
+  });
+
+  if (document.body) {
+    mutationObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class', 'id', 'style']
+    });
+  }
+
+  // =========================================================================
+  // Console & Network Interception (Main World Injection)
+  // =========================================================================
+  function injectInterceptors() {
+    try {
+      const script = document.createElement('script');
+      script.src = chrome.runtime.getURL('interceptors-main.js');
+      script.dataset.extId = chrome.runtime.id;
+      script.onload = function() {
+        this.remove();
+      };
+      (document.head || document.documentElement).appendChild(script);
+    } catch (e) {
+      console.warn('[Tom] Failed to inject interceptors:', e);
+    }
+  }
+
+  window.addEventListener('message', (event) => {
+    if (event.source !== window || event.data?.type !== 'TOM_INTERCEPTOR_EVENT') return;
+    const payload = event.data.data;
+
+    // Pipe to terminal via background -> native host
+    chrome.runtime.sendMessage({
+      type: 'interceptor_event',
+      payload
+    });
+  });
+
+  injectInterceptors();
+
+  // =========================================================================
+  // Vision Overlay (The "Look Through Tom's Eyes" Feature)
+  // =========================================================================
+  function toggleVisionOverlay() {
+    const overlayId = 'tom-vision-overlay-container';
+    const existing = document.getElementById(overlayId);
+    
+    if (existing) {
+      existing.remove();
+      return;
+    }
+
+    const container = document.createElement('div');
+    container.id = overlayId;
+    container.style.cssText = 'position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:2147483647;';
+    
+    // Target all interactive elements
+    const interactiveSel = 'a[href], button, input, select, textarea, [role="button"], [role="link"], [tabindex]';
+    const els = safeQueryAll(interactiveSel);
+    
+    els.forEach(el => {
+      if (!isVisible(el)) return;
+      
+      const rect = el.getBoundingClientRect();
+      const box = document.createElement('div');
+      
+      // Neon green bounding box
+      box.style.cssText = `
+        position:absolute; 
+        border:2px dashed #00ff88; 
+        background:rgba(0,255,136,0.1); 
+        top:${rect.top + window.scrollY}px; 
+        left:${rect.left + window.scrollX}px; 
+        width:${rect.width}px; 
+        height:${rect.height}px; 
+        pointer-events:none;
+        box-sizing:border-box;
+      `;
+      
+      // CSS Selector Label
+      const label = document.createElement('div');
+      label.textContent = selectorOf(el).substring(0, 40);
+      label.style.cssText = `
+        position:absolute; 
+        top:-18px; 
+        left:-2px; 
+        background:#0a0a0a; 
+        color:#00ff88; 
+        font-family:monospace; 
+        font-size:11px; 
+        font-weight:bold;
+        padding:2px 6px; 
+        white-space:nowrap; 
+        border:1px solid #00ff88;
+        border-radius:3px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.5);
+      `;
+      
+      box.appendChild(label);
+      container.appendChild(box);
+    });
+    
+    document.body.appendChild(container);
+  }
+
+  // =========================================================================
   // Message Handler
   // =========================================================================
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'toggle_vision_overlay') {
+      toggleVisionOverlay();
+      sendResponse({ success: true });
+      return true;
+    }
+
     if (message.type === 'tool_call') {
       executeToolCall(message.tool, message.args || {})
         .then(result => {

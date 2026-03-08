@@ -361,6 +361,20 @@ export const VISION_TOOLS = {
       },
     },
     {
+      name: 'execute_local_shell',
+      description: 'Execute a bash command on the local machine (host). This runs silently in the background and returns stdout/stderr. Use this for file operations, system checks, or running local scripts.',
+      parameters: {
+        type: "OBJECT",
+        properties: {
+          command: {
+            type: "STRING",
+            description: 'The bash command to execute (e.g. "ls -la", "grep pattern file.txt")',
+          },
+        },
+        required: ['command'],
+      },
+    },
+    {
       name: 'query_knowledge',
       description: 'Query the vectorized knowledge base of 12,419 expert documents across 25+ domains including AI/dev, legal, advocacy, and business topics.',
       parameters: {
