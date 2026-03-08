@@ -10,27 +10,13 @@ const MAX_RECONNECT_ATTEMPTS = 10;
 const BASE_RECONNECT_DELAY = 1000;
 
 // ─── Startup Logic ──────────────────────────────────────────────────────────
-const TARGET_KEY = ''; // REMOVED: Never hardcode secrets.
-
-chrome.storage.local.get(['gemini_api_key'], (data) => {
-  // Always ensure the latest key is set for this session
-  if (TARGET_KEY && data.gemini_api_key !== TARGET_KEY) {
-    console.log('[Floyd] Setting rotated API key...');
-    chrome.storage.local.set({ gemini_api_key: TARGET_KEY });
-  }
-});
+// API key is managed exclusively via the SET button in the sidepanel UI.
+// No hardcoded keys. No startup overwrites.
 
 // ─── 1. Side Panel Setup ────────────────────────────────────────────────────
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
 
-// Seed API key on install if not already set
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.local.get(['gemini_api_key'], (data) => {
-    if (!data.gemini_api_key && TARGET_KEY) {
-      chrome.storage.local.set({ gemini_api_key: TARGET_KEY });
-    }
-  });
-});
+
 
 // ─── 2. Native Messaging Connection ─────────────────────────────────────────
 async function connectNative() {
@@ -273,7 +259,10 @@ async function handleBrowserApiTool(tool, args, activeTab) {
             settled = true;
             nativePort.onMessage.removeListener(listener);
             clearTimeout(timer);
-            resolve(msg);
+            resolve({
+              success: Boolean(msg.ok),
+              ...(msg.ok ? { result: msg.result } : { error: msg.error || 'Shell command failed' })
+            });
           }
         };
         const timer = setTimeout(() => {
@@ -339,6 +328,17 @@ chrome.runtime.onConnect.addListener((port) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== 'object') return false;
 
+  // Sanitize untrusted page-derived strings: strip C0 controls except TAB, cap at 500 chars.
+  const sanitize = (s) => {
+    if (typeof s !== 'string') return '';
+    let out = '';
+    for (let i = 0; i < s.length && out.length < 500; i++) {
+      const c = s.charCodeAt(i);
+      if (c >= 0x20 || c === 0x09) out += s[i]; // allow printable + TAB only
+    }
+    return out;
+  };
+
   try {
     // 1. Content script delegating a browser API call
     if (message.action) {
@@ -360,16 +360,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'interceptor_event') {
       if (message.payload) {
         const { payload } = message;
-
-        const sanitize = (s) => {
-          if (typeof s !== 'string') return '';
-          let out = '';
-          for (let i = 0; i < s.length && out.length < 500; i++) {
-            const c = s.charCodeAt(i);
-            if (c >= 0x20 || c === 0x09) out += s[i]; // allow printable + TAB only
-          }
-          return out;
-        };
 
         const safeEvent = { tool: 'browser_event' };
         if (payload.type === 'console_error') {

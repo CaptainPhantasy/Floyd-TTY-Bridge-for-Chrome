@@ -219,6 +219,8 @@
 
   // ---- 1. analyze_page ----
   async function analyzePage(args) {
+    const includeCss = args.include_css !== false;
+    const includeAccessibility = args.include_accessibility !== false;
     const url = location.href;
     const title = document.title;
     const viewport = { width: window.innerWidth, height: window.innerHeight };
@@ -314,69 +316,74 @@
     }
 
     // CSS Snapshot
-    const allEls = safeQueryAll('*');
-    let flexCount = 0, gridCount = 0;
-    for (const el of allEls) {
-      const d = window.getComputedStyle(el).display;
-      if (d === 'flex' || d === 'inline-flex') flexCount++;
-      if (d === 'grid' || d === 'inline-grid') gridCount++;
-    }
+    let cssSnapshot = null;
+    if (includeCss) {
+      const allEls = safeQueryAll('*');
+      let flexCount = 0, gridCount = 0;
+      for (const el of allEls) {
+        const d = window.getComputedStyle(el).display;
+        if (d === 'flex' || d === 'inline-flex') flexCount++;
+        if (d === 'grid' || d === 'inline-grid') gridCount++;
+      }
 
-    const customProperties = [];
-    try {
-      for (const sheet of document.styleSheets) {
-        try {
-          for (const rule of sheet.cssRules) {
-            const text = rule.cssText || '';
-            const matches = text.match(/--[\w-]+/g);
-            if (matches) {
-              for (const m of matches) {
-                if (!customProperties.includes(m)) customProperties.push(m);
+      const customProperties = [];
+      try {
+        for (const sheet of document.styleSheets) {
+          try {
+            for (const rule of sheet.cssRules) {
+              const text = rule.cssText || '';
+              const matches = text.match(/--[\w-]+/g);
+              if (matches) {
+                for (const m of matches) {
+                  if (!customProperties.includes(m)) customProperties.push(m);
+                }
               }
             }
-          }
-        } catch (_) { /* cross-origin */ }
-      }
-    } catch (_) {}
+          } catch (_) { /* cross-origin */ }
+        }
+      } catch (_) {}
 
-    const animations = [];
-    try {
-      for (const sheet of document.styleSheets) {
-        try {
-          for (const rule of sheet.cssRules) {
-            if (rule.type === CSSRule.KEYFRAMES_RULE) {
-              animations.push(rule.name);
+      const animations = [];
+      try {
+        for (const sheet of document.styleSheets) {
+          try {
+            for (const rule of sheet.cssRules) {
+              if (rule.type === CSSRule.KEYFRAMES_RULE) {
+                animations.push(rule.name);
+              }
             }
-          }
-        } catch (_) {}
-      }
-    } catch (_) {}
+          } catch (_) {}
+        }
+      } catch (_) {}
 
-    const mediaQueries = [];
-    try {
-      for (const sheet of document.styleSheets) {
-        try {
-          for (const rule of sheet.cssRules) {
-            if (rule.type === CSSRule.MEDIA_RULE && rule.conditionText) {
-              if (!mediaQueries.includes(rule.conditionText)) mediaQueries.push(rule.conditionText);
+      const mediaQueries = [];
+      try {
+        for (const sheet of document.styleSheets) {
+          try {
+            for (const rule of sheet.cssRules) {
+              if (rule.type === CSSRule.MEDIA_RULE && rule.conditionText) {
+                if (!mediaQueries.includes(rule.conditionText)) mediaQueries.push(rule.conditionText);
+              }
             }
-          }
-        } catch (_) {}
-      }
-    } catch (_) {}
+          } catch (_) {}
+        }
+      } catch (_) {}
 
-    const cssSnapshot = {
-      flex_containers: flexCount,
-      grid_containers: gridCount,
-      custom_properties: customProperties.slice(0, 50),
-      animations: animations.slice(0, 20),
-      media_queries: mediaQueries.slice(0, 20),
-    };
+      cssSnapshot = {
+        flex_containers: flexCount,
+        grid_containers: gridCount,
+        custom_properties: customProperties.slice(0, 50),
+        animations: animations.slice(0, 20),
+        media_queries: mediaQueries.slice(0, 20),
+      };
+    }
 
     // Accessibility snapshot
     const missingAlt = images.filter(i => i.issue === 'MISSING_ALT').length;
     const missingLabels = forms.reduce((c, f) => c + f.inputs.filter(i => i.issue === 'MISSING_LABEL').length, 0);
-    const accessibilitySnapshot = { missing_alt: missingAlt, missing_labels: missingLabels };
+    const accessibilitySnapshot = includeAccessibility
+      ? { missing_alt: missingAlt, missing_labels: missingLabels }
+      : null;
 
     // Contrast issues
     const contrastIssues = computeContrastIssues();
@@ -416,14 +423,22 @@
       interactive_elements: interactiveElements,
       css_snapshot: cssSnapshot,
       accessibility_snapshot: accessibilitySnapshot,
-      contrast_issues: contrastIssues.slice(0, 10),
+      contrast_issues: includeAccessibility ? contrastIssues.slice(0, 10) : [],
       technical_issues: technicalIssues,
       score,
     };
   }
 
+  function getContrastThreshold(level, isLargeText) {
+    const normalizedLevel = String(level || 'AA').toUpperCase();
+    if (normalizedLevel === 'AAA') {
+      return isLargeText ? 4.5 : 7;
+    }
+    return isLargeText ? 3 : 4.5;
+  }
+
   /** Shared contrast issue checker used by analyze_page and check_contrast. */
-  function computeContrastIssues(scopeSelector) {
+  function computeContrastIssues(scopeSelector, level) {
     const scope = scopeSelector ? safeQuery(scopeSelector) : document.body;
     if (!scope) return [];
     const textEls = Array.from(scope.querySelectorAll('p, span, a, button, h1, h2, h3, h4, h5, h6, li, td, th, label'));
@@ -440,7 +455,7 @@
       const fontSize = parseFloat(style.fontSize);
       const fontWeight = parseInt(style.fontWeight) || 400;
       const isLargeText = fontSize >= 24 || (fontSize >= 18.66 && fontWeight >= 700);
-      const required = isLargeText ? 3 : 4.5;
+      const required = getContrastThreshold(level, isLargeText);
       if (ratio < required) {
         issues.push({
           element: selectorOf(el),
@@ -580,6 +595,7 @@
   // ---- 4. check_accessibility ----
   async function checkAccessibility(args) {
     const scopeSel = args.scope || 'body';
+    const requestedLevel = args.level || 'AA';
     const scope = safeQuery(scopeSel) || document.body;
     const violations = [];
 
@@ -674,7 +690,7 @@
     }
 
     // 1.4.3 — Contrast issues
-    const contrastIssues = computeContrastIssues(scopeSel);
+    const contrastIssues = computeContrastIssues(scopeSel, requestedLevel);
     for (const ci of contrastIssues) {
       violations.push({
         rule: '1.4.3',
@@ -687,6 +703,8 @@
 
     return {
       scope: scopeSel,
+      requested_level: requestedLevel,
+      applied_rule_set: 'fixed_core_checks',
       violations_count: violations.length,
       violations,
     };
@@ -730,8 +748,9 @@
 
   // ---- 6. check_contrast ----
   async function checkContrast(args) {
-    const issues = computeContrastIssues(args.selector);
-    return { issues_count: issues.length, issues };
+    const level = args.level || 'AA';
+    const issues = computeContrastIssues(args.selector, level);
+    return { level_applied: level, issues_count: issues.length, issues };
   }
 
   // ---- 7. extract_text ----
@@ -970,9 +989,13 @@
   async function writeObservation(args) {
     const analysis = await analyzePage(args);
     const timestamp = new Date().toISOString();
+    const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
 
     // Format as markdown
     let md = '# Page Observation\n\n';
+    if (summary) {
+      md += summary + '\n\n';
+    }
     md += '- **URL:** ' + analysis.url + '\n';
     md += '- **Title:** ' + analysis.title + '\n';
     md += '- **Timestamp:** ' + timestamp + '\n';
@@ -1072,13 +1095,17 @@
   // ---- 24. query_knowledge ----
   async function queryKnowledge(args) {
     try {
+      const limit = args.limit || args.top_k || 5;
+      const collection = args.collection || args.domain || undefined;
       const response = await fetch('http://159.65.221.69:8080/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           query: args.query,
-          limit: args.limit || 5,
-          domain_filter: args.domain || undefined,
+          limit,
+          top_k: limit,
+          collection,
+          domain_filter: collection,
           category_filter: args.category || undefined,
         }),
       });
@@ -1284,11 +1311,12 @@
     if (message.type === 'tool_call') {
       executeToolCall(message.tool, message.args || {})
         .then(result => {
+          const toolError = result && typeof result.error === 'string' ? result.error : null;
           sendResponse({
             type: 'tool_response',
             requestId: message.requestId,
-            success: true,
-            result,
+            success: !toolError,
+            ...(toolError ? { error: toolError } : { result }),
           });
         })
         .catch(err => {

@@ -21,10 +21,6 @@ export const VISION_TOOLS = {
             type: "BOOLEAN",
             description: 'Include WCAG accessibility audit. Default true.',
           },
-          viewport_scroll: {
-            type: "BOOLEAN",
-            description: 'Scroll through the entire page to capture below-fold content. Default false.',
-          },
         },
       },
     },
@@ -109,6 +105,10 @@ export const VISION_TOOLS = {
           selector: {
             type: "STRING",
             description: 'CSS selector to check, or empty for all text elements.',
+          },
+          level: {
+            type: "STRING",
+            description: 'WCAG contrast level to check: "AA" (default) or "AAA".',
           },
         },
       },
@@ -321,12 +321,7 @@ export const VISION_TOOLS = {
       description: 'Capture a screenshot of the current page. Use this to visually document the page state.',
       parameters: {
         type: "OBJECT",
-        properties: {
-          full_page: {
-            type: "BOOLEAN",
-            description: 'Capture the entire page including below-fold content. Default false.',
-          },
-        },
+        properties: {},
       },
     },
     {

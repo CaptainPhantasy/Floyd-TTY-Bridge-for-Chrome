@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Floyd's Labs TTY Bridge",
-  "version": "4.2",
+  "version": "4.6",
   "minimum_chrome_version": "116",
   "description": "AI agent browser bridge — connects LLM CLI tools to full browser control, page analysis, screen capture, and 12,000+ vectorized knowledge documents via Tom the Peep's vision engine.",
 

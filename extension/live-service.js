@@ -237,9 +237,11 @@ class LiveSession {
         throw new Error('AudioContext is not available in this browser.');
       }
       this.inputAudioContext = new AudioContextCtor({ sampleRate: 16000 });
+      if (this.inputAudioContext.state === 'suspended') await this.inputAudioContext.resume();
 
       // Output context for playing Gemini's response (24kHz)
       this.outputAudioContext = new AudioContextCtor({ sampleRate: 24000 });
+      if (this.outputAudioContext.state === 'suspended') await this.outputAudioContext.resume();
       this.outputNode = this.outputAudioContext.createGain();
       this.outputNode.connect(this.outputAudioContext.destination);
       this.nextStartTime = 0;
@@ -280,11 +282,9 @@ ${memoryContext}`;
 
       if (signal.aborted) return;
 
-      // Connect to Gemini Live (March 2026 Model)
       const sessionPromise = genAI.live.connect({
-        model: 'gemini-3.1-pro-preview-customtools',
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
-          thinking_level: 'medium', // Dynamic reasoning level
           responseModalities: [Modality.AUDIO],
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName } },
@@ -481,7 +481,12 @@ ${memoryContext}`;
       }
 
       try {
-        await this.connect(this.stream || undefined);
+        // Validate stream tracks are still live before reusing
+        const streamToReuse = this.stream?.getAudioTracks().every(
+          (t) => t.readyState === 'live',
+        ) ? this.stream : undefined;
+        if (!streamToReuse) this.stream = null;
+        await this.connect(streamToReuse);
       } catch (err) {
         // Will trigger another reconnect attempt via onerror handler (if not intentional)
         if (!this.isIntentionalDisconnect) {
@@ -859,6 +864,20 @@ ${memoryContext}`;
       this.activeSession = null;
     }
 
+    // Invalidate cached GenAI instance so a fresh one is created on reconnect
+    // (picks up any API key changes made via Settings)
+    _genAI = null;
+
+    // Invalidate media stream — tracks may be stopped after disconnect
+    if (this.stream) {
+      const hasLiveTracks = this.stream.getAudioTracks().some(
+        (t) => t.readyState === 'live',
+      );
+      if (!hasLiveTracks) {
+        this.stream = null;
+      }
+    }
+
     // Reset state
     this.state = 'idle';
     this.isIntentionalDisconnect = false;
@@ -867,4 +886,8 @@ ${memoryContext}`;
   }
 }
 
-export { LiveSession };
+function resetGenAI() {
+  _genAI = null;
+}
+
+export { LiveSession, resetGenAI };

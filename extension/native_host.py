@@ -97,14 +97,26 @@ supervisor = ProcessSupervisor()
 _stdout_lock = threading.Lock()
 
 
-def _read_exact(stream, n: int) -> Optional[bytes]:
-    """Read exactly *n* bytes from *stream*, looping on short reads."""
+def _read_exact_fd(
+    fd: int, n: int, shutdown_event: threading.Event, timeout: float = 0.1
+) -> Optional[bytes]:
     buf = bytearray()
-    while len(buf) < n:
-        chunk = stream.read(n - len(buf))
+    while len(buf) < n and not shutdown_event.is_set():
+        try:
+            ready, _, _ = select.select([fd], [], [], timeout)
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, n - len(buf))
+        except OSError:
+            return None
         if not chunk:
             return None
         buf.extend(chunk)
+    if len(buf) < n:
+        return None
     return bytes(buf)
 
 
@@ -131,9 +143,9 @@ def send_message(msg: dict[str, object]) -> None:
         sys.stdout.buffer.flush()
 
 
-def read_message() -> Optional[dict[str, object]]:
+def read_message(shutdown_event: threading.Event) -> Optional[dict[str, object]]:
     """Read a length-prefixed JSON message from stdin. Returns None on EOF."""
-    raw_length = _read_exact(sys.stdin.buffer, 4)
+    raw_length = _read_exact_fd(sys.stdin.fileno(), 4, shutdown_event)
     if raw_length is None:
         return None
     length = struct.unpack("<I", raw_length)[0]
@@ -141,7 +153,7 @@ def read_message() -> Optional[dict[str, object]]:
         return {}
     if length > CHROME_NATIVE_MSG_MAX:
         return None
-    raw_payload = _read_exact(sys.stdin.buffer, length)
+    raw_payload = _read_exact_fd(sys.stdin.fileno(), length, shutdown_event)
     if raw_payload is None:
         return None
     return json.loads(raw_payload.decode("utf-8"))
@@ -171,6 +183,7 @@ class OSCParser:
     def __init__(self):
         self._in_osc = False
         self._osc_body = ""
+        self._pending_esc = False
 
     def feed(self, data: str) -> tuple[str, list[dict[str, object]]]:
         """
@@ -181,6 +194,10 @@ class OSCParser:
         """
         text_parts: list[str] = []
         commands: list[dict[str, object]] = []
+
+        if self._pending_esc:
+            data = "\x1b" + data
+            self._pending_esc = False
 
         i = 0
         while i < len(data):
@@ -205,10 +222,16 @@ class OSCParser:
                     end_pos = st_pos
                     end_len = len(OSC_END_ST)
                 if end_pos == -1:
-                    self._osc_body += data[i:]
+                    remainder = data[i:]
+                    if remainder.endswith("\x1b"):
+                        self._osc_body += remainder[:-1]
+                        self._pending_esc = True
+                    else:
+                        self._osc_body += remainder
                     if len(self._osc_body) > OSC_MAX_BODY:
                         self._in_osc = False
                         self._osc_body = ""
+                        self._pending_esc = False
                     i = len(data)
                 else:
                     self._osc_body += data[i:end_pos]
@@ -230,7 +253,12 @@ class OSCParser:
                 esc_pos = data.find(OSC_START, i)
                 if esc_pos == -1:
                     # No escape in remaining data — all passthrough
-                    text_parts.append(data[i:])
+                    remainder = data[i:]
+                    if remainder.endswith("\x1b"):
+                        text_parts.append(remainder[:-1])
+                        self._pending_esc = True
+                    else:
+                        text_parts.append(remainder)
                     i = len(data)
                 else:
                     # Everything before the escape is passthrough
@@ -484,8 +512,10 @@ def cleanup(child_pid: Optional[int] = None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main() -> bool:
     os.makedirs(TEMP_DIR, mode=0o700, exist_ok=True)
+    shutdown_event = threading.Event()
+    stdin_fd = sys.stdin.fileno()
 
     # Determine shell
     shell = os.environ.get("SHELL", "/bin/zsh")
@@ -558,7 +588,9 @@ def main() -> None:
     env["LANG"] = "en_US.UTF-8"
     env["FLOYD_TTY_BRIDGE"] = "4.6"
     env["FLOYD_TOOLS_AVAILABLE"] = "1"
-    env["FLOYD_TOOLS_SDK"] = "/usr/local/share/floyd/floyd-tools.sh"
+    env["FLOYD_TOOLS_SDK"] = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "floyd-tools.sh"
+    )
 
     child = subprocess.Popen(
         [shell, "-l"],
@@ -576,9 +608,11 @@ def main() -> None:
     # Register cleanup
     atexit.register(cleanup, child.pid)
 
+    def request_shutdown() -> None:
+        shutdown_event.set()
+
     def sigterm_handler(_sig, _frame):
-        cleanup(child.pid)
-        sys.exit(0)
+        request_shutdown()
 
     signal.signal(signal.SIGTERM, sigterm_handler)
     signal.signal(signal.SIGINT, sigterm_handler)
@@ -595,12 +629,10 @@ def main() -> None:
 
     # Start the PTY reader thread
     parser = OSCParser()
-    shutdown_event = threading.Event()
 
     reader_thread = threading.Thread(
         target=pty_to_chrome,
         args=(master_fd, parser, shutdown_event),
-        daemon=True,
     )
     reader_thread.start()
 
@@ -610,23 +642,25 @@ def main() -> None:
             supervisor.check_zombies()
             time.sleep(5)
 
-    threading.Thread(target=watchdog, daemon=True).start()
+    watchdog_thread = threading.Thread(target=watchdog)
+    watchdog_thread.start()
 
     def chrome_reader():
         while not shutdown_event.is_set():
             try:
-                msg = read_message()
+                msg = read_message(shutdown_event)
                 if msg is None:
                     break
                 if msg:
                     chrome_to_pty(master_fd, msg)
             except Exception:
                 break
-        shutdown_event.set()
+        request_shutdown()
 
-    chrome_thread = threading.Thread(target=chrome_reader, daemon=True)
+    chrome_thread = threading.Thread(target=chrome_reader)
     chrome_thread.start()
 
+    force_exit = False
     try:
         while not shutdown_event.is_set():
             if child.poll() is not None:
@@ -641,15 +675,36 @@ def main() -> None:
     except Exception:
         pass
     finally:
-        shutdown_event.set()
-        reader_thread.join(timeout=2)
-        chrome_thread.join(timeout=2)
+        request_shutdown()
+        cleanup(child.pid)
+        try:
+            os.close(stdin_fd)
+        except OSError:
+            pass
         try:
             os.close(master_fd)
         except OSError:
             pass
-        cleanup(child.pid)
+        chrome_thread.join(timeout=2)
+        reader_thread.join(timeout=2)
+        watchdog_thread.join(timeout=2)
+        force_exit = (
+            chrome_thread.is_alive()
+            or reader_thread.is_alive()
+            or watchdog_thread.is_alive()
+        )
+    return force_exit
 
 
 if __name__ == "__main__":
-    main()
+    force_exit = False
+    try:
+        force_exit = main()
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        if force_exit:
+            os._exit(0)

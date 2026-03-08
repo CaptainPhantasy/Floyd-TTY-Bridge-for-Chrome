@@ -5,9 +5,11 @@ console.log('[Floyd] sidepanel.js initializing...');
 
 // Dynamic import for Gemini Live
 let LiveSession = null;
+let resetGenAI = null;
 import('./live-service.js')
   .then(mod => { 
-    LiveSession = mod.LiveSession; 
+    LiveSession = mod.LiveSession;
+    resetGenAI = mod.resetGenAI;
     console.log('[Floyd] Live service loaded'); 
   })
   .catch(err => console.warn('[Floyd] Live service unavailable:', err.message));
@@ -149,6 +151,25 @@ term.onData((data) => {
   }
 });
 
+// Prevent Chrome side panel from intercepting terminal keys (arrows, Tab, etc.)
+// Without this, curses/TUI apps can't receive arrow key escape sequences.
+const TERMINAL_KEYS = new Set([
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'Home', 'End', 'PageUp', 'PageDown',
+  'Tab', 'Escape', 'Backspace', 'Delete',
+  'F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12',
+]);
+
+document.addEventListener('keydown', (e) => {
+  const isInput = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA';
+  if (!isInput && TERMINAL_KEYS.has(e.key)) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+}, true);
+
+term.attachCustomKeyEventHandler(() => true);
+
 // Aggressive focus trap
 const termContainer = document.getElementById('terminal-container');
 if (termContainer) {
@@ -165,6 +186,11 @@ window.addEventListener('click', (e) => {
   if (!isInput && !isNav) {
     term.focus();
   }
+});
+
+window.addEventListener('focus', () => term.focus());
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) setTimeout(() => term.focus(), 50);
 });
 
 /**
@@ -245,6 +271,27 @@ function showToast(message) {
   setTimeout(() => toast.classList.remove('visible'), 3000);
 }
 
+function countLandmarks(landmarks) {
+  if (!landmarks || typeof landmarks !== 'object') return 0;
+  return Object.values(landmarks).reduce((count, selectors) => {
+    return count + (Array.isArray(selectors) ? selectors.length : 0);
+  }, 0);
+}
+
+function getAnalyzeIssueSummary(result) {
+  const accessibilitySnapshot = result.accessibility_snapshot || {};
+  const accessibilitySignals =
+    (accessibilitySnapshot.missing_alt || 0) +
+    (accessibilitySnapshot.missing_labels || 0);
+
+  return {
+    landmarks: countLandmarks(result.landmarks),
+    accessibilitySignals,
+    contrastIssues: result.contrast_issues?.length || 0,
+    technicalIssues: result.technical_issues?.length || 0,
+  };
+}
+
 // ─── Tool Call Infrastructure ───
 
 function sendToolCall(tool, args = {}) {
@@ -297,12 +344,13 @@ document.getElementById('btn-analyze')?.addEventListener('click', async () => {
   const result = await sendToolCall('analyze_page', { include_css: true, include_accessibility: true });
   if (result.success) {
     const r = result.result;
+    const summary = getAnalyzeIssueSummary(r);
     term.writeln(`\x1b[1;32m[Page Analysis Complete]\x1b[0m`);
     term.writeln(`  URL: \x1b[36m${r.url}\x1b[0m`);
     term.writeln(`  Title: ${r.title}`);
     term.writeln(`  Score: \x1b[${r.score >= 80 ? '32' : r.score >= 50 ? '33' : '31'}m${r.score}/100\x1b[0m`);
-    term.writeln(`  Landmarks: ${r.landmarks?.length || 0} | Headings: ${r.headings?.length || 0}`);
-    term.writeln(`  Issues: ${r.technical_issues?.length || 0} technical, ${r.accessibility?.violations_count || 0} a11y, ${r.contrast_issues?.length || 0} contrast`);
+    term.writeln(`  Landmarks: ${summary.landmarks} | Headings: ${r.headings?.length || 0}`);
+    term.writeln(`  Issues: ${summary.technicalIssues} technical, ${summary.accessibilitySignals} a11y signals, ${summary.contrastIssues} contrast`);
     term.writeln(`  Interactive: ${r.interactive_elements?.length || 0} elements`);
     if (r.technical_issues?.length > 0) {
       term.writeln(`\x1b[1;31m  Technical Issues:\x1b[0m`);
@@ -333,9 +381,9 @@ document.getElementById('btn-a11y')?.addEventListener('click', async () => {
   const result = await sendToolCall('check_accessibility', { level: 'AA' });
   if (result.success) {
     const r = result.result;
-    term.writeln(`\x1b[1;${r.violations_count === 0 ? '32' : '31'}m[A11Y Audit: ${r.violations_count} violations (WCAG ${r.level_checked})]\x1b[0m`);
+    term.writeln(`\x1b[1;${r.violations_count === 0 ? '32' : '31'}m[A11Y Audit: ${r.violations_count} violations (${r.applied_rule_set}, requested ${r.requested_level})]\x1b[0m`);
     (r.violations || []).forEach(v => {
-      const color = v.severity === 'serious' ? '31' : '33';
+      const color = v.severity === 'error' ? '31' : '33';
       term.writeln(`  \x1b[${color}m[${v.severity}]\x1b[0m ${v.rule}`);
       term.writeln(`    Element: \x1b[36m${v.element}\x1b[0m`);
       term.writeln(`    Fix: ${v.fix}`);
@@ -381,6 +429,7 @@ document.getElementById('btn-live')?.addEventListener('click', async () => {
   if (liveSession && liveSession.getState() !== 'idle') {
     term.writeln('\x1b[1;33m[Disconnecting Gemini Live...]\x1b[0m');
     liveSession.disconnect();
+    liveSession = null;
     btnLive.classList.remove('live-active');
     btnLive.textContent = 'LIVE';
     document.getElementById('btn-screen').classList.remove('media-active');
@@ -436,6 +485,7 @@ document.getElementById('btn-live')?.addEventListener('click', async () => {
     term.writeln('\x1b[1;32m[Live session connected — speak to Tom]\x1b[0m');
   } catch (err) {
     term.writeln(`\x1b[1;31m[Failed to start live: ${err.message}]\x1b[0m`);
+    liveSession = null;
     btnLive.classList.remove('live-active');
     btnLive.textContent = 'LIVE';
     if (audioStream) {
@@ -534,6 +584,7 @@ document.getElementById('btn-settings-save')?.addEventListener('click', async ()
   const voice = document.getElementById('input-voice').value.trim() || 'Puck';
 
   await chrome.storage.local.set({ gemini_api_key: key, live_voice: voice });
+  if (resetGenAI) resetGenAI();
   document.getElementById('settings-modal').classList.remove('visible');
   showToast('Settings saved');
   term.writeln(`\x1b[1;32m[Settings saved — API key ${key ? 'configured' : 'cleared'}, voice: ${voice}]\x1b[0m`);
