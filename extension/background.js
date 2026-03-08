@@ -264,16 +264,25 @@ async function handleBrowserApiTool(tool, args, activeTab) {
       }};
     }
     case 'execute_local_shell': {
-      // Forward this to native host to execute
       if (!nativePort) return { success: false, error: 'Native host not connected' };
       return new Promise((resolve) => {
         const requestId = 'shell_' + Date.now();
+        let settled = false;
         const listener = (msg) => {
           if (msg.type === 'tool_response' && msg.requestId === requestId) {
+            settled = true;
             nativePort.onMessage.removeListener(listener);
+            clearTimeout(timer);
             resolve(msg);
           }
         };
+        const timer = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            try { nativePort.onMessage.removeListener(listener); } catch (_) {}
+            resolve({ success: false, error: 'Shell command timed out (30s)' });
+          }
+        }, 30000);
         nativePort.onMessage.addListener(listener);
         nativePort.postMessage({
           type: 'execute_shell',
@@ -344,36 +353,76 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     // 2. Interceptor events (console.error, network failures)
+    //    SECURITY: Page-derived strings are UNTRUSTED. Never inject raw text
+    //    into the PTY stream — a malicious page could embed \r\n + shell commands.
+    //    Instead, send as a structured OSC 7701 JSON event that the agent SDK
+    //    parses safely, or display only in the side panel.
     if (message.type === 'interceptor_event') {
-      if (nativePort && message.payload) {
-        // Format as red text for the agent terminal
+      if (message.payload) {
         const { payload } = message;
-        let text = `\r\n\x1b[31;1m[BROWSER ERROR]\x1b[0m `;
+
+        const sanitize = (s) => {
+          if (typeof s !== 'string') return '';
+          let out = '';
+          for (let i = 0; i < s.length && out.length < 500; i++) {
+            const c = s.charCodeAt(i);
+            if (c >= 0x20 || c === 0x09) out += s[i]; // allow printable + TAB only
+          }
+          return out;
+        };
+
+        const safeEvent = { tool: 'browser_event' };
         if (payload.type === 'console_error') {
-          text += `Console: ${payload.message}`;
+          safeEvent.event = 'console_error';
+          safeEvent.message = sanitize(payload.message);
         } else if (payload.type === 'network_error') {
-          text += `Network: ${payload.method} ${payload.url} (${payload.status || payload.error})`;
+          safeEvent.event = 'network_error';
+          safeEvent.method = sanitize(payload.method);
+          safeEvent.url = sanitize(payload.url);
+          safeEvent.status = typeof payload.status === 'number' ? payload.status : 0;
         } else if (payload.type === 'unhandled_exception') {
-          text += `Exception: ${payload.message} at ${payload.filename}:${payload.lineno}`;
+          safeEvent.event = 'exception';
+          safeEvent.message = sanitize(payload.message);
+          safeEvent.source = sanitize(payload.filename) + ':' + (payload.lineno || 0);
         } else if (payload.type === 'unhandled_rejection') {
-          text += `Promise Rejection: ${payload.reason}`;
+          safeEvent.event = 'promise_rejection';
+          safeEvent.reason = sanitize(payload.reason);
+        } else {
+          return false; // Unknown interceptor type — drop silently
         }
-        text += '\r\n';
-        
-        // Inject directly into the terminal stream for the agent to see
-        nativePort.postMessage({ type: 'pty_input', data: text });
+
+        if (nativePort) {
+          nativePort.postMessage({
+            type: 'tool_call',
+            requestId: 'intercept_' + Date.now(),
+            tool: 'browser_event',
+            args: safeEvent,
+          });
+        }
+
+        if (panelPort) {
+          panelPort.postMessage({ type: 'system_event', event: 'browser_error', details: safeEvent });
+        }
       }
       return false;
     }
 
-    // 3. System events (DOM mutations, etc.)
     if (message.type === 'system_event') {
+      const safeMsg = {
+        type: 'system_event',
+        event: sanitize(message.event || ''),
+        tabId: typeof message.tabId === 'number' ? message.tabId : undefined,
+        url: typeof message.url === 'string' ? sanitize(message.url) : undefined,
+      };
       if (nativePort) {
-        const osc = `\x1b]7701;${JSON.stringify({ type: 'system_event', ...message })}\x07`;
-        nativePort.postMessage({ type: 'pty_input', data: osc });
+        nativePort.postMessage({
+          type: 'tool_call',
+          requestId: 'sys_' + Date.now(),
+          tool: 'system_event',
+          args: safeMsg,
+        });
       }
-      // Also notify panel
-      if (panelPort) panelPort.postMessage(message);
+      if (panelPort) panelPort.postMessage(safeMsg);
       return false;
     }
   } catch (error) {

@@ -76,6 +76,7 @@ const term = initTerminal();
 let port = null;
 let requestCounter = 0;
 const pendingCallbacks = new Map();
+const MAX_PENDING_CALLBACKS = 100;
 
 function connect() {
   try {
@@ -136,14 +137,14 @@ term.onData((data) => {
     try { port.postMessage({ type: 'pty_input', data }); } catch (e) {}
   } else {
     let offset = 0;
-    function sendNextChunk() {
+    const sendNextChunk = () => {
       if (offset < data.length && port) {
         const chunk = data.substring(offset, offset + CHUNK_SIZE);
         try { port.postMessage({ type: 'pty_input', data: chunk }); } catch (e) {}
         offset += CHUNK_SIZE;
         setTimeout(sendNextChunk, 0);
       }
-    }
+    };
     sendNextChunk();
   }
 });
@@ -249,6 +250,12 @@ function showToast(message) {
 function sendToolCall(tool, args = {}) {
   const requestId = 'panel_' + (++requestCounter) + '_' + Date.now();
   return new Promise((resolve) => {
+    if (pendingCallbacks.size >= MAX_PENDING_CALLBACKS) {
+      const oldest = pendingCallbacks.keys().next().value;
+      const oldCb = pendingCallbacks.get(oldest);
+      pendingCallbacks.delete(oldest);
+      if (oldCb) oldCb({ success: false, error: 'Evicted' });
+    }
     pendingCallbacks.set(requestId, resolve);
     setTimeout(() => {
       if (pendingCallbacks.has(requestId)) {
@@ -299,7 +306,7 @@ document.getElementById('btn-analyze')?.addEventListener('click', async () => {
     term.writeln(`  Interactive: ${r.interactive_elements?.length || 0} elements`);
     if (r.technical_issues?.length > 0) {
       term.writeln(`\x1b[1;31m  Technical Issues:\x1b[0m`);
-      r.technical_issues.forEach(i => term.writeln(`    - ${i}`));
+      r.technical_issues.forEach(i => { term.writeln(`    - ${i}`); });
     }
   } else {
     term.writeln(`\x1b[1;31m[Error: ${result.error}]\x1b[0m`);
@@ -379,7 +386,7 @@ document.getElementById('btn-live')?.addEventListener('click', async () => {
     document.getElementById('btn-screen').classList.remove('media-active');
     document.getElementById('btn-camera').classList.remove('media-active');
     if (audioStream) {
-      audioStream.getTracks().forEach(t => t.stop());
+      audioStream.getTracks().forEach(t => { t.stop(); });
       audioStream = null;
     }
     term.writeln('\x1b[1;32m[Live session ended]\x1b[0m');
@@ -432,7 +439,7 @@ document.getElementById('btn-live')?.addEventListener('click', async () => {
     btnLive.classList.remove('live-active');
     btnLive.textContent = 'LIVE';
     if (audioStream) {
-      audioStream.getTracks().forEach(t => t.stop());
+      audioStream.getTracks().forEach(t => { t.stop(); });
       audioStream = null;
     }
   }
