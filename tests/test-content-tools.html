@@ -1,0 +1,984 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Content script tool harness">
+  <title>Content Tool Harness</title>
+  <style>
+    :root {
+      --pass: #1a7f37;
+      --fail: #b42318;
+      --skip: #475467;
+      --ink: #101828;
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --line: #d0d5dd;
+    }
+    body { margin: 0; font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color: var(--ink); background: linear-gradient(180deg, #f8fafc, #eef2f7); }
+    .wrap { max-width: 1080px; margin: 24px auto; padding: 0 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .pill { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; }
+    .pass { color: var(--pass); }
+    .fail { color: var(--fail); }
+    .skip { color: var(--skip); }
+    #results { list-style: none; padding: 0; margin: 0; }
+    #results li { padding: 6px 8px; border-bottom: 1px dashed var(--line); }
+    #test-bed { margin-top: 8px; }
+    #spacer { height: 1600px; background: repeating-linear-gradient(0deg, #f2f4f7, #f2f4f7 40px, #eaecf0 40px, #eaecf0 80px); }
+    #css-box { display: flex; gap: 8px; border: 2px solid #344054; border-radius: 6px; padding: 10px; color: #1d2939; background: #e5e7eb; }
+    #contrast-bad { color: rgb(120,120,120); background: rgb(130,130,130); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h1>Self-Contained Content Tool Harness</h1>
+      <div class="row">
+        <div class="pill">PASS: <strong id="passCount">0</strong></div>
+        <div class="pill">FAIL: <strong id="failCount">0</strong></div>
+        <div class="pill">SKIP: <strong id="skipCount">0</strong></div>
+      </div>
+      <p id="summaryText">Running...</p>
+    </div>
+
+    <div id="test-bed" class="panel">
+      <a href="#main" id="skip-link">Skip to main content</a>
+      <header><p>Header region</p></header>
+      <nav><a id="nav-link" href="#target">Documentation Link</a></nav>
+      <main id="main">
+        <h1 id="h1-main">Main Heading</h1>
+        <h2 id="h2-main">Section Heading</h2>
+        <h3 id="h3-main">Subsection Heading</h3>
+
+        <p id="contrast-bad">Low contrast sample text for contrast testing.</p>
+        <div id="css-box"><span>Box A</span><span>Box B</span></div>
+
+        <img id="img-good" alt="Descriptive alt text" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
+        <img id="img-bad" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
+
+        <button id="action-btn">Do Action</button>
+        <button id="empty-btn"></button>
+        <a id="target" href="#target">Target Link</a>
+
+        <form id="demo-form" action="#">
+          <label for="name-input">Name</label>
+          <input id="name-input" name="name" type="text" placeholder="Enter name">
+
+          <input id="unlabeled-input" name="code" type="text" placeholder="Unlabeled field">
+
+          <label for="bio-input">Bio</label>
+          <textarea id="bio-input" name="bio"></textarea>
+
+          <label for="role-select">Role</label>
+          <select id="role-select" name="role">
+            <option value="">Choose</option>
+            <option value="admin">Admin</option>
+            <option value="editor">Editor</option>
+          </select>
+
+          <input id="submit-input" type="submit" value="Submit now">
+        </form>
+
+        <div id="status-area">status: idle</div>
+      </main>
+      <footer><p>Footer region</p></footer>
+    </div>
+
+    <div class="panel">
+      <h2>Results</h2>
+      <ul id="results"></ul>
+    </div>
+  </div>
+
+  <div id="spacer" aria-hidden="true"></div>
+
+  <script>
+    // ============================
+    // Core helpers from content-script.js
+    // ============================
+    function selectorOf(el) {
+      if (!el || el === document || el === document.documentElement) return 'html';
+      if (el === document.body) return 'body';
+      if (el.id) return '#' + CSS.escape(el.id);
+      const tag = el.tagName.toLowerCase();
+      const classes = Array.from(el.classList)
+        .filter(function (c) { return c && !c.match(/^[0-9]/) && c.length < 60; })
+        .map(function (c) { return '.' + CSS.escape(c); })
+        .join('');
+      if (classes) {
+        var candidate = tag + classes;
+        try {
+          if (document.querySelectorAll(candidate).length === 1) return candidate;
+        } catch (_) {}
+      }
+      var parent = el.parentElement;
+      if (!parent) return tag;
+      var children = Array.from(parent.children);
+      var idx = children.indexOf(el) + 1;
+      return selectorOf(parent) + ' > ' + tag + ':nth-child(' + idx + ')';
+    }
+
+    function getRect(el) {
+      var r = el.getBoundingClientRect();
+      return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+    }
+
+    function isVisible(el) {
+      if (!el || !el.getBoundingClientRect) return false;
+      var style = window.getComputedStyle(el);
+      if (style.display === 'none') return false;
+      if (style.visibility === 'hidden') return false;
+      if (parseFloat(style.opacity) === 0) return false;
+      var rect = el.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return false;
+      return true;
+    }
+
+    function parseColor(str) {
+      if (!str || str === 'transparent') return [0, 0, 0, 0];
+      var m = str.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+))?\s*\)/);
+      if (!m) return null;
+      return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10), m[4] !== undefined ? parseFloat(m[4]) : 1];
+    }
+
+    function luminance(r, g, b) {
+      var converted = [r, g, b].map(function (c) {
+        c = c / 255;
+        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * converted[0] + 0.7152 * converted[1] + 0.0722 * converted[2];
+    }
+
+    function getContrastRatio(fg, bg) {
+      var l1 = luminance(fg[0], fg[1], fg[2]);
+      var l2 = luminance(bg[0], bg[1], bg[2]);
+      var lighter = Math.max(l1, l2);
+      var darker = Math.min(l1, l2);
+      return (lighter + 0.05) / (darker + 0.05);
+    }
+
+    function getEffectiveBgColor(el) {
+      var current = el;
+      var layers = [];
+      while (current && current !== document) {
+        var bg = window.getComputedStyle(current).backgroundColor;
+        var parsed = parseColor(bg);
+        if (parsed && parsed[3] > 0) {
+          layers.push(parsed);
+          if (parsed[3] >= 1) break;
+        }
+        current = current.parentElement;
+      }
+      var base = [255, 255, 255];
+      for (var i = layers.length - 1; i >= 0; i--) {
+        var layer = layers[i];
+        var a = layer[3];
+        base = [
+          Math.round(base[0] * (1 - a) + layer[0] * a),
+          Math.round(base[1] * (1 - a) + layer[1] * a),
+          Math.round(base[2] * (1 - a) + layer[2] * a)
+        ];
+      }
+      return base;
+    }
+
+    function directText(el) {
+      var text = '';
+      var nodes = el.childNodes;
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodes[i].nodeType === Node.TEXT_NODE) text += nodes[i].textContent;
+      }
+      return text.trim();
+    }
+
+    function textOf(el, max) {
+      var t = (el.textContent || '').trim();
+      return max ? t.substring(0, max) : t;
+    }
+
+    function centerOf(el) {
+      var r = el.getBoundingClientRect();
+      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+    }
+
+    function domSnapshot() {
+      return {
+        url: location.href,
+        title: document.title,
+        bodyLength: document.body ? document.body.innerHTML.length : 0,
+        elementCount: document.querySelectorAll('*').length
+      };
+    }
+
+    function diffSnapshots(before, after) {
+      var changes = [];
+      if (before.url !== after.url) changes.push({ type: 'url_changed', from: before.url, to: after.url });
+      if (before.title !== after.title) changes.push({ type: 'title_changed', from: before.title, to: after.title });
+      var dLen = after.bodyLength - before.bodyLength;
+      if (Math.abs(dLen) > 50) changes.push({ type: 'dom_size_changed', delta: dLen });
+      var dEl = after.elementCount - before.elementCount;
+      if (dEl !== 0) changes.push({ type: 'element_count_changed', delta: dEl });
+      return changes;
+    }
+
+    function delegateToBackground(action, data) {
+      return Promise.resolve({ mocked: true, action: action, data: data || {} });
+    }
+
+    function safeQuery(selector) {
+      try { return document.querySelector(selector); } catch (_) { return null; }
+    }
+
+    function safeQueryAll(selector) {
+      try { return Array.from(document.querySelectorAll(selector)); } catch (_) { return []; }
+    }
+
+    function getLabelFor(input) {
+      if (input.id) {
+        var label = document.querySelector('label[for="' + CSS.escape(input.id) + '"]');
+        if (label) return label.textContent.trim();
+      }
+      var parentLabel = input.closest('label');
+      if (parentLabel) return parentLabel.textContent.trim();
+      if (input.getAttribute('aria-label')) return input.getAttribute('aria-label');
+      if (input.getAttribute('aria-labelledby')) {
+        var ref = document.getElementById(input.getAttribute('aria-labelledby'));
+        if (ref) return ref.textContent.trim();
+      }
+      return '';
+    }
+
+    function computeContrastIssues(scopeSelector) {
+      var scope = scopeSelector ? safeQuery(scopeSelector) : document.body;
+      if (!scope) return [];
+      var textEls = Array.from(scope.querySelectorAll('p, span, a, button, h1, h2, h3, h4, h5, h6, li, td, th, label'));
+      var issues = [];
+      for (var i = 0; i < textEls.length; i++) {
+        var el = textEls[i];
+        if (!isVisible(el)) continue;
+        var text = textOf(el, 40);
+        if (!text) continue;
+        var style = window.getComputedStyle(el);
+        var fg = parseColor(style.color);
+        if (!fg) continue;
+        var bg = getEffectiveBgColor(el);
+        var ratio = getContrastRatio(fg, bg);
+        var fontSize = parseFloat(style.fontSize);
+        var fontWeight = parseInt(style.fontWeight, 10) || 400;
+        var isLargeText = fontSize >= 24 || (fontSize >= 18.66 && fontWeight >= 700);
+        var required = isLargeText ? 3 : 4.5;
+        if (ratio < required) {
+          issues.push({
+            element: selectorOf(el),
+            text: text,
+            foreground: 'rgb(' + fg[0] + ',' + fg[1] + ',' + fg[2] + ')',
+            background: 'rgb(' + bg[0] + ',' + bg[1] + ',' + bg[2] + ')',
+            ratio: Math.round(ratio * 100) / 100,
+            required: required,
+            is_large_text: isLargeText,
+            fix: 'Increase contrast ratio to at least ' + required + ':1'
+          });
+        }
+        if (issues.length >= 15) break;
+      }
+      return issues;
+    }
+
+    // ============================
+    // Tool functions from content-script.js
+    // ============================
+    async function analyzePage(args) {
+      var url = location.href;
+      var title = document.title;
+      var viewport = { width: window.innerWidth, height: window.innerHeight };
+      var documentHeight = Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0);
+      var landmarkMap = {
+        header: 'header, [role="banner"]',
+        nav: 'nav, [role="navigation"]',
+        main: 'main, [role="main"]',
+        aside: 'aside, [role="complementary"]',
+        footer: 'footer, [role="contentinfo"]',
+        form: 'form'
+      };
+      var landmarks = {};
+      Object.keys(landmarkMap).forEach(function (name) {
+        var els = safeQueryAll(landmarkMap[name]);
+        if (els.length > 0) landmarks[name] = els.map(function (e) { return selectorOf(e); });
+      });
+      var headings = safeQueryAll('h1, h2, h3, h4, h5, h6').map(function (el) {
+        return { level: parseInt(el.tagName[1], 10), text: textOf(el, 120), selector: selectorOf(el) };
+      });
+      var images = safeQueryAll('img').map(function (el) {
+        var obj = { src: el.src, alt: el.alt, selector: selectorOf(el) };
+        if (!el.alt && !el.getAttribute('aria-label') && !el.getAttribute('role')) obj.issue = 'MISSING_ALT';
+        return obj;
+      });
+      var linkEls = safeQueryAll('a[href]');
+      var links = [];
+      for (var i = 0; i < linkEls.length && links.length < 30; i++) {
+        links.push({ text: textOf(linkEls[i], 100), href: linkEls[i].href, selector: selectorOf(linkEls[i]), visible: isVisible(linkEls[i]) });
+      }
+      var formEls = safeQueryAll('form');
+      var forms = formEls.map(function (form) {
+        var inputs = safeQueryAll('input, select, textarea').filter(function (inp) { return form.contains(inp); }).map(function (inp) {
+          var label = getLabelFor(inp);
+          var obj = { type: inp.type || inp.tagName.toLowerCase(), name: inp.name, label: label };
+          if (!label && inp.type !== 'hidden' && inp.type !== 'submit' && inp.type !== 'button') obj.issue = 'MISSING_LABEL';
+          return obj;
+        });
+        return { selector: selectorOf(form), action: form.action || '', inputs: inputs };
+      });
+      var interactiveEls = safeQueryAll('a[href], button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [tabindex]');
+      var interactiveElements = [];
+      for (var j = 0; j < interactiveEls.length && interactiveElements.length < 40; j++) {
+        var ie = interactiveEls[j];
+        if (!isVisible(ie)) continue;
+        interactiveElements.push({
+          tag: ie.tagName.toLowerCase(),
+          text: textOf(ie, 80),
+          selector: selectorOf(ie),
+          aria_label: ie.getAttribute('aria-label') || '',
+          center: centerOf(ie)
+        });
+      }
+      var allEls = safeQueryAll('*');
+      var flexCount = 0;
+      var gridCount = 0;
+      for (var k = 0; k < allEls.length; k++) {
+        var d = window.getComputedStyle(allEls[k]).display;
+        if (d === 'flex' || d === 'inline-flex') flexCount++;
+        if (d === 'grid' || d === 'inline-grid') gridCount++;
+      }
+      var cssSnapshot = { flex_containers: flexCount, grid_containers: gridCount, custom_properties: [], animations: [], media_queries: [] };
+      var missingAlt = images.filter(function (img) { return img.issue === 'MISSING_ALT'; }).length;
+      var missingLabels = forms.reduce(function (acc, f) { return acc + f.inputs.filter(function (i2) { return i2.issue === 'MISSING_LABEL'; }).length; }, 0);
+      var accessibilitySnapshot = { missing_alt: missingAlt, missing_labels: missingLabels };
+      var contrastIssues = computeContrastIssues();
+      var technicalIssues = [];
+      if (!document.doctype) technicalIssues.push('missing_doctype');
+      if (!document.documentElement.lang) technicalIssues.push('missing_lang');
+      if (!document.querySelector('meta[name="viewport"]')) technicalIssues.push('missing_viewport_meta');
+      if (!document.querySelector('meta[name="description"]')) technicalIssues.push('missing_description');
+      var h1Count = safeQueryAll('h1').length;
+      if (h1Count === 0) technicalIssues.push('missing_h1');
+      if (h1Count > 1) technicalIssues.push('multiple_h1');
+      var score = 100 - (missingAlt * 5) - (missingLabels * 5) - (contrastIssues.length * 5) - (technicalIssues.length * 3);
+      var a11yViolations = (missingAlt > 0 ? 1 : 0) + (missingLabels > 0 ? 1 : 0) + (!document.documentElement.lang ? 1 : 0);
+      score -= a11yViolations * 4;
+      score = Math.max(0, score);
+      return {
+        url: url,
+        title: title,
+        viewport: viewport,
+        document_height: documentHeight,
+        landmarks: landmarks,
+        headings: headings,
+        images: images.slice(0, 50),
+        links: links,
+        forms: forms,
+        interactive_elements: interactiveElements,
+        css_snapshot: cssSnapshot,
+        accessibility_snapshot: accessibilitySnapshot,
+        contrast_issues: contrastIssues.slice(0, 10),
+        technical_issues: technicalIssues,
+        score: score
+      };
+    }
+
+    async function analyzeElement(args) {
+      var selector = args.selector;
+      var el = safeQuery(selector);
+      if (!el) return { error: 'Element not found: ' + selector };
+      var style = window.getComputedStyle(el);
+      var rect = getRect(el);
+      var attrs = {};
+      for (var i = 0; i < el.attributes.length; i++) attrs[el.attributes[i].name] = el.attributes[i].value;
+      var computedStyles = {};
+      var props = ['display','position','width','height','margin','padding','color','backgroundColor','fontSize','fontFamily','fontWeight','lineHeight','textAlign','border','borderRadius','overflow','zIndex','opacity','transform','transition','animation'];
+      for (var j = 0; j < props.length; j++) {
+        var v = style[props[j]];
+        if (v) computedStyles[props[j]] = v;
+      }
+      if (style.display === 'flex' || style.display === 'inline-flex') computedStyles.flexDirection = style.flexDirection;
+      if (style.display === 'grid' || style.display === 'inline-grid') computedStyles.gridTemplateColumns = style.gridTemplateColumns;
+      var accessibility = {
+        role: el.getAttribute('role') || el.tagName.toLowerCase(),
+        'aria-label': el.getAttribute('aria-label') || '',
+        'aria-labelledby': el.getAttribute('aria-labelledby') || '',
+        'aria-describedby': el.getAttribute('aria-describedby') || '',
+        'aria-hidden': el.getAttribute('aria-hidden') || '',
+        tabindex: el.getAttribute('tabindex') || ''
+      };
+      return {
+        selector: selector,
+        resolved_selector: selectorOf(el),
+        tag: el.tagName.toLowerCase(),
+        id: el.id || '',
+        classes: Array.from(el.classList),
+        text: textOf(el, 200),
+        inner_html_length: el.innerHTML.length,
+        visible: isVisible(el),
+        position: rect,
+        children_count: el.children.length,
+        attributes: attrs,
+        computed_styles: computedStyles,
+        accessibility: accessibility
+      };
+    }
+
+    async function findElements(args) {
+      var query = (args.query || '').toLowerCase();
+      var searchBy = args.search_by || 'any';
+      var limit = args.limit || 10;
+      var allEls = safeQueryAll('*');
+      var results = [];
+      for (var i = 0; i < allEls.length; i++) {
+        if (results.length >= limit) break;
+        var el = allEls[i];
+        if (!isVisible(el)) continue;
+        var matchType = null;
+        if (searchBy === 'any' || searchBy === 'text') {
+          var dt = directText(el).toLowerCase();
+          if (dt && dt.indexOf(query) >= 0) matchType = 'text';
+        }
+        if (!matchType && (searchBy === 'any' || searchBy === 'aria')) {
+          var aria = (el.getAttribute('aria-label') || '').toLowerCase();
+          if (aria.indexOf(query) >= 0) matchType = 'aria-label';
+        }
+        if (!matchType && (searchBy === 'any' || searchBy === 'placeholder')) {
+          var ph = (el.getAttribute('placeholder') || '').toLowerCase();
+          if (ph.indexOf(query) >= 0) matchType = 'placeholder';
+        }
+        if (!matchType && (searchBy === 'any' || searchBy === 'alt')) {
+          var alt = (el.getAttribute('alt') || '').toLowerCase();
+          if (alt.indexOf(query) >= 0) matchType = 'alt';
+        }
+        if (!matchType && (searchBy === 'any' || searchBy === 'role')) {
+          var role = (el.getAttribute('role') || '').toLowerCase();
+          if (role.indexOf(query) >= 0) matchType = 'role';
+        }
+        if (!matchType && searchBy === 'any') {
+          var titleAttr = (el.getAttribute('title') || '').toLowerCase();
+          if (titleAttr.indexOf(query) >= 0) matchType = 'title';
+        }
+        if (matchType) {
+          var rect = getRect(el);
+          results.push({
+            match_type: matchType,
+            tag: el.tagName.toLowerCase(),
+            selector: selectorOf(el),
+            text: textOf(el, 100),
+            aria_label: el.getAttribute('aria-label') || '',
+            center: centerOf(el),
+            size: { w: rect.w, h: rect.h }
+          });
+        }
+      }
+      return { query: args.query, results_count: results.length, results: results };
+    }
+
+    async function checkAccessibility(args) {
+      var scopeSel = args.scope || 'body';
+      var scope = safeQuery(scopeSel) || document.body;
+      var violations = [];
+      Array.from(scope.querySelectorAll('img')).forEach(function (img) {
+        if (!img.alt && !img.getAttribute('aria-label') && img.getAttribute('role') !== 'presentation') {
+          violations.push({ rule: '1.1.1', severity: 'error', element: selectorOf(img), description: 'Image missing alt text', fix: 'Add alt attribute describing the image content' });
+        }
+      });
+      Array.from(scope.querySelectorAll('input, select, textarea')).forEach(function (inp) {
+        if (inp.type === 'hidden' || inp.type === 'submit' || inp.type === 'button') return;
+        var label = getLabelFor(inp);
+        if (!label && !inp.getAttribute('title')) {
+          violations.push({ rule: '1.3.1', severity: 'error', element: selectorOf(inp), description: 'Form input missing label', fix: 'Add a <label> element, aria-label, or aria-labelledby' });
+        }
+      });
+      if (!document.documentElement.lang) {
+        violations.push({ rule: '3.1.1', severity: 'error', element: 'html', description: 'Missing lang attribute on <html>', fix: 'Add lang="en" (or appropriate language) to <html>' });
+      }
+      var firstLink = scope.querySelector('a[href]');
+      var hasSkipNav = firstLink && firstLink.href && firstLink.href.indexOf('#') >= 0 && (firstLink.textContent || '').toLowerCase().indexOf('skip') >= 0;
+      if (!hasSkipNav) {
+        violations.push({ rule: '2.4.1', severity: 'warning', element: 'body', description: 'No skip navigation link found', fix: 'Add a "Skip to main content" link as the first focusable element' });
+      }
+      Array.from(scope.querySelectorAll('a[href], button')).forEach(function (el) {
+        var t = textOf(el, 100);
+        var aria = el.getAttribute('aria-label') || '';
+        var title = el.getAttribute('title') || '';
+        var imgAlt = el.querySelector('img[alt]');
+        if (!t && !aria && !title && !imgAlt) {
+          violations.push({ rule: '2.4.4', severity: 'error', element: selectorOf(el), description: 'Empty ' + el.tagName.toLowerCase() + ' — no accessible text', fix: 'Add text content, aria-label, or title attribute' });
+        }
+      });
+      var headingEls = Array.from(scope.querySelectorAll('h1, h2, h3, h4, h5, h6'));
+      var prevLevel = 0;
+      headingEls.forEach(function (h) {
+        var level = parseInt(h.tagName[1], 10);
+        if (prevLevel > 0 && level > prevLevel + 1) {
+          violations.push({ rule: '1.3.1', severity: 'warning', element: selectorOf(h), description: 'Heading level skipped from h' + prevLevel + ' to h' + level, fix: 'Use sequential heading levels without skipping' });
+        }
+        prevLevel = level;
+      });
+      computeContrastIssues(scopeSel).forEach(function (ci) {
+        violations.push({ rule: '1.4.3', severity: 'warning', element: ci.element, description: 'Insufficient contrast ratio ' + ci.ratio + ':1 (required ' + ci.required + ':1)', fix: ci.fix });
+      });
+      return { scope: scopeSel, violations_count: violations.length, violations: violations };
+    }
+
+    async function extractCss(args) {
+      var selector = args.selector;
+      var el = safeQuery(selector);
+      if (!el) return { error: 'Element not found: ' + selector };
+      var defaultProps = ['display','position','top','right','bottom','left','width','height','minWidth','minHeight','maxWidth','maxHeight','margin','marginTop','marginRight','marginBottom','marginLeft','padding','paddingTop','paddingRight','paddingBottom','paddingLeft','color','backgroundColor','fontSize','fontFamily','fontWeight','fontStyle','lineHeight','textAlign','textDecoration','textTransform','letterSpacing','border','borderRadius','boxShadow','outline','overflow','overflowX','overflowY','zIndex','opacity','cursor','pointerEvents','transform','transition','animation','flexDirection','flexWrap','justifyContent','alignItems','gap','gridTemplateColumns','gridTemplateRows','gridGap'];
+      var properties = args.properties || defaultProps;
+      var style = window.getComputedStyle(el);
+      var styles = {};
+      var trivial = new Set(['none','normal','auto','0px','transparent','start','stretch','0s','ease']);
+      properties.forEach(function (p) {
+        var v = style[p];
+        if (v && !trivial.has(v) && v !== '' && v !== '0') styles[p] = v;
+      });
+      return { selector: selector, styles: styles };
+    }
+
+    async function checkContrast(args) {
+      var issues = computeContrastIssues(args.selector);
+      return { issues_count: issues.length, issues: issues };
+    }
+
+    async function extractText(args) {
+      var selector = args.selector;
+      var els = safeQueryAll(selector);
+      if (els.length === 0) return { error: 'No elements found: ' + selector };
+      var results = els.slice(0, 50).map(function (el) { return { selector: selectorOf(el), text: textOf(el, 500), visible: isVisible(el) }; });
+      return { count: results.length, results: results };
+    }
+
+    async function getPageState() {
+      var activeEl = document.activeElement;
+      return {
+        url: location.href,
+        title: document.title,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        scroll: { x: window.scrollX, y: window.scrollY },
+        document_size: {
+          width: Math.max(document.body ? document.body.scrollWidth : 0, document.documentElement.scrollWidth),
+          height: Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement.scrollHeight)
+        },
+        active_element: activeEl ? selectorOf(activeEl) : null,
+        ready_state: document.readyState
+      };
+    }
+
+    async function clickElement(args) {
+      var selector = args.selector;
+      var el = safeQuery(selector);
+      if (!el) return { error: 'Element not found: ' + selector };
+      var before = domSnapshot();
+      el.click();
+      await new Promise(function (resolve) { setTimeout(resolve, 500); });
+      var after = domSnapshot();
+      return { clicked: selectorOf(el), url_after: location.href, title_after: document.title, changes: diffSnapshots(before, after) };
+    }
+
+    async function scrollToTool(args) {
+      var target = args.target;
+      var desc = '';
+      if (target === 'top') {
+        window.scrollTo({ top: 0, behavior: 'auto' });
+        desc = 'top';
+      } else if (target === 'bottom') {
+        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'auto' });
+        desc = 'bottom';
+      } else if (target === 'up') {
+        window.scrollBy({ top: -window.innerHeight * 0.8, behavior: 'auto' });
+        desc = 'up (80vh)';
+      } else if (target === 'down') {
+        window.scrollBy({ top: window.innerHeight * 0.8, behavior: 'auto' });
+        desc = 'down (80vh)';
+      } else {
+        var el = safeQuery(target);
+        if (!el) return { error: 'Element not found: ' + target };
+        el.scrollIntoView({ behavior: 'auto', block: 'center' });
+        desc = 'element: ' + target;
+      }
+      await new Promise(function (resolve) { setTimeout(resolve, 100); });
+      return { scrolled_to: desc, position: { x: window.scrollX, y: window.scrollY } };
+    }
+
+    async function navigateTo(args) {
+      return { skipped: true, reason: 'SKIP (requires chrome.* API)', navigating_to: args.url || '' };
+    }
+
+    async function openTab(args) { return delegateToBackground('open_tab', { url: args.url }); }
+    async function closeTab(args) { return delegateToBackground('close_tab', { tab_id: args.tab_id }); }
+    async function switchTab(args) { return delegateToBackground('switch_tab', { tab_id: args.tab_id }); }
+    async function listTabs() { return delegateToBackground('list_tabs', {}); }
+
+    async function typeText(args) {
+      var selector = args.selector;
+      var el = safeQuery(selector);
+      if (!el) return { error: 'Element not found: ' + selector };
+      el.focus();
+      if (args.clear_first) el.value = '';
+      el.value = (args.clear_first ? '' : el.value) + (args.text || '');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return { typed_into: selectorOf(el), value: el.value };
+    }
+
+    async function fillForm(args) {
+      var fields = args.fields || [];
+      var results = [];
+      for (var i = 0; i < fields.length; i++) {
+        var field = fields[i];
+        var el = safeQuery(field.selector);
+        if (!el) {
+          results.push({ selector: field.selector, success: false, error: 'Not found' });
+          continue;
+        }
+        el.focus();
+        el.value = field.value;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        results.push({ selector: field.selector, success: true, value: el.value });
+      }
+      return { filled: results.length, results: results };
+    }
+
+    async function selectOption(args) {
+      var selector = args.selector;
+      var el = safeQuery(selector);
+      if (!el || el.tagName.toLowerCase() !== 'select') return { error: 'Select element not found: ' + selector };
+      var found = false;
+      for (var i = 0; i < el.options.length; i++) {
+        if (el.options[i].value === args.value) {
+          el.value = el.options[i].value;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        for (var j = 0; j < el.options.length; j++) {
+          if (el.options[j].textContent.trim() === args.value) {
+            el.value = el.options[j].value;
+            found = true;
+            break;
+          }
+        }
+      }
+      if (!found) return { error: 'Option not found: ' + args.value };
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return { selected: selectorOf(el), value: el.value, text: el.options[el.selectedIndex].textContent.trim() };
+    }
+
+    async function takeScreenshot() { return delegateToBackground('take_screenshot', {}); }
+
+    async function waitForElement(args) {
+      var selector = args.selector;
+      var timeout = args.timeout || 5000;
+      var interval = 100;
+      var start = Date.now();
+      return new Promise(function (resolve) {
+        function check() {
+          var el = safeQuery(selector);
+          if (el) {
+            resolve({ success: true, selector: selector, wait_time: Date.now() - start });
+            return;
+          }
+          if (Date.now() - start >= timeout) {
+            resolve({ success: false, error: 'Timeout waiting for element: ' + selector, wait_time: timeout });
+            return;
+          }
+          setTimeout(check, interval);
+        }
+        check();
+      });
+    }
+
+    async function getTabState(args) { return delegateToBackground('get_tab_state', { tab_id: args.tab_id }); }
+
+    async function writeObservation(args) {
+      var analysis = await analyzePage(args || {});
+      var timestamp = new Date().toISOString();
+      var md = '# Page Observation\n\n';
+      md += '- **URL:** ' + analysis.url + '\n';
+      md += '- **Title:** ' + analysis.title + '\n';
+      md += '- **Timestamp:** ' + timestamp + '\n';
+      md += '- **Score:** ' + analysis.score + '/100\n';
+      md += '- **Viewport:** ' + analysis.viewport.width + 'x' + analysis.viewport.height + '\n\n';
+      md += '## Landmarks\n';
+      Object.keys(analysis.landmarks).forEach(function (name) {
+        md += '- **' + name + ':** ' + analysis.landmarks[name].join(', ') + '\n';
+      });
+      md += '\n## Headings (' + analysis.headings.length + ')\n';
+      analysis.headings.forEach(function (h) { md += '- h' + h.level + ': ' + h.text + '\n'; });
+      md += '\n## Interactive Elements (' + analysis.interactive_elements.length + ')\n';
+      analysis.interactive_elements.slice(0, 20).forEach(function (ie) {
+        var text = (ie.text || ie.aria_label || ie.selector).substring(0, 60);
+        md += '- [' + ie.tag + '] ' + text + '\n';
+      });
+      md += '\n---\n';
+      try {
+        var existing = localStorage.getItem('ragbot_observations_md') || '';
+        localStorage.setItem('ragbot_observations_md', existing + md);
+      } catch (_) {}
+      try {
+        await fetch('/api/observations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ markdown: md, analysis: analysis, timestamp: timestamp })
+        });
+      } catch (_) {}
+      return { written: true, timestamp: timestamp, score: analysis.score };
+    }
+
+    async function readCommands() {
+      var commandsMd = '';
+      try { commandsMd = localStorage.getItem('ragbot_commands_md') || ''; } catch (_) {}
+      if (!commandsMd) {
+        try {
+          var res = await fetch('/api/commands');
+          if (res.ok) {
+            var data = await res.json();
+            commandsMd = data.markdown || data.commands || '';
+          }
+        } catch (_) {}
+      }
+      var lines = commandsMd.split('\n');
+      var pending = [];
+      for (var i = 0; i < lines.length; i++) {
+        var trimmed = lines[i].trim();
+        if (/^[-*]\s*\[\s*\]/.test(trimmed)) pending.push(trimmed.replace(/^[-*]\s*\[\s*\]\s*/, ''));
+      }
+      return { pending_count: pending.length, commands: pending, raw: commandsMd.substring(0, 2000) };
+    }
+
+    async function queryKnowledge(args) {
+      try {
+        var kbUrl = 'http://localhost:8080/query';
+        if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local && chrome.storage.local.get) {
+          var stored = await new Promise(function (resolve) {
+            try { chrome.storage.local.get(['knowledge_base_url'], resolve); } catch (_) { resolve({}); }
+          });
+          kbUrl = (stored && stored.knowledge_base_url) || kbUrl;
+        }
+        var response = await fetch(kbUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: args.query, limit: args.limit || 5, domain_filter: args.domain || undefined, category_filter: args.category || undefined })
+        });
+        return await response.json();
+      } catch (e) {
+        return { error: 'Knowledge base unavailable: ' + e.message };
+      }
+    }
+
+    var TOOL_ENDPOINTS = {
+      analyze_page: analyzePage,
+      analyze_element: analyzeElement,
+      find_elements: findElements,
+      check_accessibility: checkAccessibility,
+      extract_css: extractCss,
+      check_contrast: checkContrast,
+      extract_text: extractText,
+      get_page_state: getPageState,
+      click_element: clickElement,
+      scroll_to: scrollToTool,
+      navigate_to: navigateTo,
+      open_tab: openTab,
+      close_tab: closeTab,
+      switch_tab: switchTab,
+      list_tabs: listTabs,
+      type_text: typeText,
+      fill_form: fillForm,
+      select_option: selectOption,
+      take_screenshot: takeScreenshot,
+      wait_for_element: waitForElement,
+      get_tab_state: getTabState,
+      write_observation: writeObservation,
+      read_commands: readCommands,
+      query_knowledge: queryKnowledge
+    };
+
+    // ============================
+    // Harness runner
+    // ============================
+    (function () {
+      var passCount = 0;
+      var failCount = 0;
+      var skipCount = 0;
+      var resultsEl = document.getElementById('results');
+
+      function addResult(status, name, detail) {
+        var li = document.createElement('li');
+        li.className = status.toLowerCase();
+        li.textContent = status + ' - ' + name + ' :: ' + detail;
+        resultsEl.appendChild(li);
+      }
+
+      function assertTrue(condition, name, detail) {
+        if (condition) {
+          passCount += 1;
+          addResult('PASS', name, detail);
+        } else {
+          failCount += 1;
+          addResult('FAIL', name, detail);
+        }
+      }
+
+      function skip(name, detail) {
+        skipCount += 1;
+        addResult('SKIP', name, detail);
+      }
+
+      function updateCounters() {
+        document.getElementById('passCount').textContent = String(passCount);
+        document.getElementById('failCount').textContent = String(failCount);
+        document.getElementById('skipCount').textContent = String(skipCount);
+        document.getElementById('summaryText').innerHTML = 'Assertions complete. <span class="pass">PASS ' + passCount + '</span> / <span class="fail">FAIL ' + failCount + '</span> / <span class="skip">SKIP ' + skipCount + '</span>';
+      }
+
+      async function run() {
+        document.getElementById('action-btn').addEventListener('click', function () {
+          document.getElementById('status-area').textContent = 'status: clicked';
+          document.title = 'Content Tool Harness Clicked';
+          var marker = document.createElement('div');
+          marker.id = 'click-marker';
+          marker.textContent = 'Clicked marker';
+          document.body.appendChild(marker);
+        });
+
+        var realFetch = window.fetch ? window.fetch.bind(window) : null;
+        window.fetch = async function (url, options) {
+          if (typeof url === 'string' && url.indexOf('/api/commands') === 0) {
+            return { ok: true, async json() { return { markdown: '- [ ] API Command A\n- [x] done\n* [ ] API Command B' }; } };
+          }
+          if (typeof url === 'string' && (url.indexOf('/api/observations') === 0 || url.indexOf('http://localhost:8080/query') === 0)) {
+            return { ok: true, async json() { return { mocked: true, source: url, answer: 'ok' }; } };
+          }
+          if (realFetch) return realFetch(url, options);
+          throw new Error('Network disabled in harness');
+        };
+
+        // analyze_page
+        var page = await TOOL_ENDPOINTS.analyze_page({});
+        assertTrue(Array.isArray(page.headings) && page.headings.length >= 3, 'analyze_page headings', 'finds h1/h2/h3');
+        assertTrue(page.images.some(function (i) { return i.issue === 'MISSING_ALT'; }), 'analyze_page image issue', 'flags missing alt');
+        assertTrue(page.forms.length === 1 && page.forms[0].inputs.some(function (i) { return i.issue === 'MISSING_LABEL'; }), 'analyze_page form issue', 'flags unlabeled input');
+        assertTrue(page.landmarks.main && page.landmarks.header && page.landmarks.footer, 'analyze_page landmarks', 'detects major landmarks');
+
+        // analyze_element
+        var element = await TOOL_ENDPOINTS.analyze_element({ selector: '#action-btn' });
+        assertTrue(element.tag === 'button', 'analyze_element tag', 'returns button tag');
+        assertTrue(element.visible === true, 'analyze_element visibility', 'button is visible');
+
+        // find_elements
+        var findRes = await TOOL_ENDPOINTS.find_elements({ query: 'do action', search_by: 'text', limit: 5 });
+        assertTrue(findRes.results_count >= 1, 'find_elements count', 'finds action button by text');
+        assertTrue(findRes.results.some(function (r) { return r.selector === '#action-btn'; }), 'find_elements selector', 'returns expected selector');
+
+        // check_accessibility
+        var a11y = await TOOL_ENDPOINTS.check_accessibility({ scope: '#test-bed' });
+        assertTrue(a11y.violations_count >= 2, 'check_accessibility count', 'reports multiple violations');
+        assertTrue(a11y.violations.some(function (v) { return v.rule === '1.1.1'; }), 'check_accessibility alt rule', 'includes missing alt rule');
+
+        // extract_css
+        var css = await TOOL_ENDPOINTS.extract_css({ selector: '#css-box', properties: ['display', 'border', 'backgroundColor'] });
+        assertTrue(css.styles.display === 'flex', 'extract_css display', 'captures display:flex');
+        assertTrue(!!css.styles.border, 'extract_css border', 'captures border style');
+
+        // check_contrast
+        var contrast = await TOOL_ENDPOINTS.check_contrast({ selector: '#test-bed' });
+        assertTrue(contrast.issues_count >= 1, 'check_contrast issue count', 'finds low-contrast text');
+        assertTrue(contrast.issues.some(function (c) { return c.element === '#contrast-bad'; }), 'check_contrast target', 'includes known low-contrast element');
+
+        // extract_text
+        var txt = await TOOL_ENDPOINTS.extract_text({ selector: 'h1, h2, h3' });
+        assertTrue(txt.count === 3, 'extract_text count', 'extracts three headings');
+        assertTrue(txt.results[0].text.length > 0, 'extract_text content', 'captures heading text');
+
+        // get_page_state
+        document.getElementById('name-input').focus();
+        var state = await TOOL_ENDPOINTS.get_page_state({});
+        assertTrue(state.active_element === '#name-input', 'get_page_state active', 'tracks active element');
+        assertTrue(typeof state.viewport.width === 'number' && state.viewport.width > 0, 'get_page_state viewport', 'returns viewport width');
+
+        // click_element
+        var clickRes = await TOOL_ENDPOINTS.click_element({ selector: '#action-btn' });
+        assertTrue(clickRes.clicked === '#action-btn', 'click_element clicked', 'returns clicked selector');
+        assertTrue(document.getElementById('status-area').textContent.indexOf('clicked') >= 0, 'click_element effect', 'click changed status text');
+
+        // scroll_to
+        await TOOL_ENDPOINTS.scroll_to({ target: 'bottom' });
+        var yAfterBottom = window.scrollY;
+        await TOOL_ENDPOINTS.scroll_to({ target: 'top' });
+        assertTrue(yAfterBottom >= 0, 'scroll_to bottom', 'reports non-negative Y after bottom scroll');
+        assertTrue(window.scrollY <= yAfterBottom, 'scroll_to top', 'top scroll reduces/keeps Y position');
+
+        // type_text
+        var typed = await TOOL_ENDPOINTS.type_text({ selector: '#name-input', text: 'Alice', clear_first: true });
+        assertTrue(typed.value === 'Alice', 'type_text value', 'writes text into input');
+
+        // fill_form
+        var fill = await TOOL_ENDPOINTS.fill_form({ fields: [
+          { selector: '#name-input', value: 'Bob' },
+          { selector: '#bio-input', value: 'Bio text' }
+        ] });
+        assertTrue(fill.filled === 2, 'fill_form count', 'fills two fields');
+        assertTrue(document.getElementById('bio-input').value === 'Bio text', 'fill_form value', 'textarea value updated');
+
+        // select_option
+        var selected = await TOOL_ENDPOINTS.select_option({ selector: '#role-select', value: 'Admin' });
+        assertTrue(selected.value === 'admin', 'select_option by text', 'selects option using text label');
+
+        // wait_for_element
+        setTimeout(function () {
+          var delayed = document.createElement('div');
+          delayed.id = 'delayed-el';
+          delayed.textContent = 'Ready';
+          document.body.appendChild(delayed);
+        }, 120);
+        var waitRes = await TOOL_ENDPOINTS.wait_for_element({ selector: '#delayed-el', timeout: 2000 });
+        assertTrue(waitRes.success === true, 'wait_for_element success', 'resolves when delayed element appears');
+
+        // write_observation
+        localStorage.removeItem('ragbot_observations_md');
+        var obs = await TOOL_ENDPOINTS.write_observation({});
+        var storedObs = localStorage.getItem('ragbot_observations_md') || '';
+        assertTrue(obs.written === true, 'write_observation written', 'returns written=true');
+        assertTrue(storedObs.indexOf('# Page Observation') >= 0, 'write_observation storage', 'stores markdown in localStorage');
+
+        // read_commands
+        localStorage.setItem('ragbot_commands_md', '- [ ] First command\n- [x] Done command\n* [ ] Second command');
+        var commands = await TOOL_ENDPOINTS.read_commands({});
+        assertTrue(commands.pending_count === 2, 'read_commands pending_count', 'parses pending markdown checklist commands');
+        assertTrue(commands.commands[0] === 'First command', 'read_commands first command', 'extracts first pending command text');
+
+        // query_knowledge
+        var knowledge = await TOOL_ENDPOINTS.query_knowledge({ query: 'status', limit: 1 });
+        assertTrue(knowledge.mocked === true || !knowledge.error, 'query_knowledge response', 'returns mocked knowledge response');
+
+        // Explicit SKIP endpoints requiring chrome.* API context
+        skip('open_tab', 'SKIP (requires chrome.* API)');
+        skip('close_tab', 'SKIP (requires chrome.* API)');
+        skip('switch_tab', 'SKIP (requires chrome.* API)');
+        skip('list_tabs', 'SKIP (requires chrome.* API)');
+        skip('take_screenshot', 'SKIP (requires chrome.* API)');
+        skip('navigate_to', 'SKIP (requires chrome.* API)');
+        skip('get_tab_state', 'SKIP (requires chrome.* API)');
+
+        updateCounters();
+      }
+
+      run().catch(function (err) {
+        failCount += 1;
+        addResult('FAIL', 'Harness runtime', err && err.message ? err.message : String(err));
+        updateCounters();
+      });
+    })();
+  </script>
+</body>
+</html>

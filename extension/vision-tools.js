@@ -396,5 +396,50 @@ export const VISION_TOOLS = {
         required: ['query'],
       },
     },
+    {
+      name: 'set_of_marks',
+      description: 'Render numbered marks (visual labels) on interactive elements. Use this to help grounding when looking at screenshots.',
+      parameters: {
+        type: "OBJECT",
+        properties: {
+          show: {
+            type: "BOOLEAN",
+            description: 'Whether to show or hide the marks. Default true.',
+          },
+          filter: {
+            type: "STRING",
+            description: 'Which elements to mark: "interactive" (default), "forms", or "all".',
+          },
+        },
+      },
+    },
+    {
+      name: 'click_mark',
+      description: 'Click on a numbered mark created by set_of_marks.',
+      parameters: {
+        type: "OBJECT",
+        properties: {
+          mark: {
+            type: "NUMBER",
+            description: 'The number of the mark to click.',
+          },
+        },
+        required: ['mark'],
+      },
+    },
   ],
+};
+
+// A lightweight subset of tools specifically for the low-latency Voice session.
+export const LIVE_VISION_TOOLS = {
+  functionDeclarations: VISION_TOOLS.functionDeclarations.filter(tool =>
+    [
+      'click_element',
+      'type_text',
+      'scroll_to',
+      'navigate_to',
+      'analyze_page',
+      'get_page_state'
+    ].includes(tool.name)
+  )
 };

@@ -1,0 +1,6 @@
+AGENT: "\u001b]12;#A8255A\u0007\u001b[5 q"
+AGENT: "\u001b]1337;RemoteHost=douglastalley@Mac\u0007\u001b]1337;CurrentDir=/Volumes/Storage/Floyd TTY Bridge for Chrome\u0007\u001b]1337;ShellIntegrationVersion=14;shell=zsh\u0007"
+AGENT: "\u001b]7;file://Mac/Volumes/Storage/Floyd%20TTY%20Bridge%20for%20Chrome\u0007"
+AGENT: "\u001b]133;D;0\u0007"
+AGENT: "\u001b]1337;RemoteHost=douglastalley@Mac\u0007\u001b]1337;CurrentDir=/Volumes/Storage/Floyd TTY Bridge for Chrome\u0007"
+AGENT: "\u001b[5 q\u001b]12;#A8255A\u0007"
