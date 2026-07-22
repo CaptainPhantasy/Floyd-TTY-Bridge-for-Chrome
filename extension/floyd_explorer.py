@@ -24,11 +24,11 @@ def emit_telemetry(path):
     try:
         if not os.path.exists(path):
             return
-        
+
         is_dir = os.path.isdir(path)
         size = os.path.getsize(path) if not is_dir else 0
         mtype, _ = mimetypes.guess_type(path)
-        
+
         metadata = {
             "type": "file_highlight",
             "path": os.path.abspath(path),
@@ -37,7 +37,7 @@ def emit_telemetry(path):
             "mime_type": mtype or ("directory" if is_dir else "application/octet-stream"),
             "modified": datetime.fromtimestamp(os.path.getmtime(path)).isoformat()
         }
-        
+
         # Add a small snippet if it's a text file
         if not is_dir and size > 0 and (mtype and mtype.startswith("text") or size < 10240):
             try:
@@ -61,7 +61,7 @@ class FloydExplorer:
         self.active_pane = 0 # 0 for left, 1 for right
         self.cursor_pos = [0, 0] # indices for [left, right]
         self.panes = [[], []] # file lists
-        
+
         curses.curs_set(1) # Show hardware cursor
         self.stdscr.nodelay(0)
         self.refresh_files()
@@ -75,7 +75,7 @@ class FloydExplorer:
                 self.panes[i] = [".."] + items
             except Exception:
                 self.panes[i] = [".."]
-            
+
             # Bound cursor
             if self.cursor_pos[i] >= len(self.panes[i]):
                 self.cursor_pos[i] = max(0, len(self.panes[i]) - 1)
@@ -84,19 +84,19 @@ class FloydExplorer:
         self.stdscr.erase()
         height, width = self.stdscr.getmaxyx()
         pane_width = width // 2
-        
+
         for i in range(2):
             x_offset = i * pane_width
             title = self.left_pane_dir if i == 0 else self.right_pane_dir
             attr = curses.A_REVERSE if self.active_pane == i else curses.A_BOLD
-            
+
             # Draw header
             self.stdscr.addstr(0, x_offset, title[:pane_width-1].ljust(pane_width-1), attr)
-            
+
             # Draw files
             for idx, item in enumerate(self.panes[i]):
                 if idx >= height - 2: break
-                
+
                 y = idx + 1
                 display_text = item[:pane_width-2]
                 if self.active_pane == i and self.cursor_pos[i] == idx:
@@ -110,9 +110,9 @@ class FloydExplorer:
         current_dir = self.left_pane_dir if self.active_pane == 0 else self.right_pane_dir
         current_item = self.panes[self.active_pane][self.cursor_pos[self.active_pane]]
         self.stdscr.addstr(height-1, 0, f" [TAB] Switch Pane | [ENTER] Open | [Q] Quit | Item: {current_item}"[:width-1], curses.A_REVERSE)
-        
+
         self.stdscr.refresh()
-        
+
         # Telemetry
         full_path = os.path.join(current_dir, current_item)
         emit_telemetry(full_path)
@@ -120,7 +120,7 @@ class FloydExplorer:
     def run(self):
         while True:
             key = self.stdscr.getch()
-            
+
             if key == ord('q'):
                 break
             elif key == curses.KEY_RESIZE:
@@ -138,13 +138,13 @@ class FloydExplorer:
                 current_dir = self.left_pane_dir if self.active_pane == 0 else self.right_pane_dir
                 item = self.panes[self.active_pane][self.cursor_pos[self.active_pane]]
                 new_path = os.path.abspath(os.path.join(current_dir, item))
-                
+
                 if os.path.isdir(new_path):
                     if self.active_pane == 0: self.left_pane_dir = new_path
                     else: self.right_pane_dir = new_path
                     self.cursor_pos[self.active_pane] = 0
                     self.refresh_files()
-            
+
             self.draw()
 
 def main():

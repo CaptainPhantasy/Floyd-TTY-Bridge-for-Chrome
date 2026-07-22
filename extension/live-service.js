@@ -4,19 +4,11 @@
  * Vanilla JavaScript ES module conversion of Tom_The_Peep/services/liveService.ts
  * for use in a Chrome extension side panel.
  *
- * Changes from the TypeScript original:
- *   - All TypeScript types/annotations removed
- *   - GoogleGenAI imported from local ./lib/genai.mjs
- *   - VISION_TOOLS imported from sibling ./vision-tools.js
- *   - API key sourced from chrome.storage.local instead of process.env
- *   - Memory system (memoryManager, generateMemoryPatch) removed; checkpoint is a no-op
- *   - getLiveVoice() removed; voice defaults to 'Puck'
- *   - executeToolCall replaced by a toolExecutor callback passed to the constructor
- *   - AudioWorklet path kept as /audio/pcm-processor.worklet.js with ScriptProcessor fallback
+ * OPTIMIZED: Circuit Breakers, Auto-Barge-in, Worklet Batching, Load Shedding.
  */
 
 import { GoogleGenAI, Modality } from './lib/genai.mjs';
-import { VISION_TOOLS } from './vision-tools.js';
+import { LIVE_VISION_TOOLS } from './vision-tools.js';
 
 // ---------------------------------------------------------------------------
 // Cached GoogleGenAI singleton
@@ -24,13 +16,6 @@ import { VISION_TOOLS } from './vision-tools.js';
 
 let _genAI = null;
 
-/**
- * Retrieve (or lazily create) a GoogleGenAI instance.
- * The API key is read from chrome.storage.local asynchronously, so this
- * function returns a Promise.
- *
- * @returns {Promise<GoogleGenAI>}
- */
 async function getGenAI() {
   if (_genAI) return _genAI;
 
@@ -46,77 +31,79 @@ async function getGenAI() {
 }
 
 // ---------------------------------------------------------------------------
+// Adaptive video quality profiles
+// ---------------------------------------------------------------------------
+
+const ADAPTIVE_PROFILES = {
+  HIGH:   { fps: 1.5, quality: 0.3, maxWidth: 640,  intervalMs: 666  }, // Capped for Voice Mode
+  MEDIUM: { fps: 1,   quality: 0.4, maxWidth: 640,  intervalMs: 1000 },
+  LOW:    { fps: 0.5, quality: 0.6, maxWidth: 1280, intervalMs: 2000 },
+};
+
+const ADAPTIVE_DIFF_W = 80;
+const ADAPTIVE_DIFF_H = 60;
+const ADAPTIVE_PIXEL_SAMPLE_STEP = 10;
+const ADAPTIVE_PIXEL_THRESHOLD = 30;
+const ADAPTIVE_MODE_COOLDOWN_MS = 1000;
+
+// ---------------------------------------------------------------------------
 // LiveSession
 // ---------------------------------------------------------------------------
 
 class LiveSession {
-  // State management
-  /** @type {'idle'|'connecting'|'connected'|'reconnecting'|'disconnecting'} */
   state = 'idle';
 
   // Audio contexts and nodes
-  /** @type {AudioContext|null} */
   inputAudioContext = null;
-  /** @type {AudioContext|null} */
   outputAudioContext = null;
-  /** @type {MediaStreamAudioSourceNode|null} */
   inputSource = null;
-  /** @type {ScriptProcessorNode|null} */
   processor = null;
-  /** @type {AudioWorkletNode|null} */
   workletNode = null;
-  /** @type {GainNode|null} */
   outputNode = null;
   nextStartTime = 0;
-  /** @type {Set<AudioBufferSourceNode>} */
   sources = new Set();
   suppressOutputUntilMs = 0;
   lastOutputAtMs = 0;
 
-  // Noise gate thresholds for echo rejection
-  // When AI is silent, use low threshold so user speech is detected easily.
-  // When AI is speaking, raise threshold so speaker echo doesn't trigger barge-in.
-  silenceThreshold = 0.015;       // RMS floor when AI is silent
-  echoRejectThreshold = 0.06;     // RMS floor when AI is speaking (rejects speaker bleed)
-  echoTailMs = 600;               // Keep elevated threshold this long after AI stops
+  // Secret Sauce 1: Audio Batching Buffer
+  _audioBuffer = [];
+
+  // Tuned Noise gate thresholds
+  silenceThreshold = 0.02;
+  echoRejectThreshold = 0.10;
+  echoTailMs = 1200;
+
+  // Circuit Breaker to prevent API bans
+  _consecutiveSendErrors = 0;
+  _maxConsecutiveErrors = 5;
 
   // Session management
-  /** @type {Promise|null} */
   activeSession = null;
-  /** @type {MediaStream|null} */
   stream = null;
-  /** @type {AbortController|null} */
   abortController = null;
-
-  // Reconnection management
   reconnectAttempts = 0;
   maxReconnectAttempts = 5;
-  reconnectDelay = 1000; // Start at 1s, max 30s
+  reconnectDelay = 1000;
   isIntentionalDisconnect = false;
-  /** @type {number|null} */
   reconnectTimeout = null;
 
   // Memory and video
-  /** @type {string|null} */
   currentSessionId = null;
-  /** @type {HTMLVideoElement|null} */
   videoElement = null;
-  /** @type {HTMLCanvasElement|null} */
   canvasElement = null;
-  /** @type {number|null} */
   videoInterval = null;
-  /** @type {MediaStream|null} */
   videoStream = null;
-  /** @type {string[]} */
+
+  // Adaptive video quality state
+  _prevDiffData = null;
+  _diffCanvas = null;
+  _diffCtx = null;
+  _adaptiveMode = 'MEDIUM';
+  _lastModeSwitch = 0;
+  _videoTimeout = null;
+
   transcriptBuffer = [];
 
-  /**
-   * @param {(text: string) => void} onMessage
-   * @param {(base64: string) => void} onAudioData
-   * @param {(error: object) => void} [onError]
-   * @param {(status: string) => void} [onStatusChange]
-   * @param {(toolName: string, args: object) => Promise<any>} [toolExecutor]
-   */
   constructor(onMessage, onAudioData, onError, onStatusChange, toolExecutor) {
     this.onMessage = onMessage;
     this.onAudioData = onAudioData;
@@ -125,172 +112,120 @@ class LiveSession {
     this.toolExecutor = toolExecutor;
   }
 
-  /**
-   * Get current connection state
-   */
   getState() {
     return this.state;
   }
 
-  /**
-   * Check if session is currently connected
-   */
   isConnected() {
     return this.state === 'connected';
   }
 
-  /**
-   * Whether the agent currently has audio playing/queued locally.
-   * Used for barge-in interruption.
-   */
+  async sendText(text) {
+    if (this.state !== 'connected' || !this.activeSession) return false;
+    try {
+      const session = await this.activeSession;
+      if (!session || this.state !== 'connected') return false;
+      session.sendClientContent({
+        turns: [{ role: 'user', parts: [{ text }] }],
+        turnComplete: true,
+      });
+      return true;
+    } catch (err) {
+      console.warn('[Live] Failed to send text:', err);
+      return false;
+    }
+  }
+
   isSpeaking() {
     return this.sources.size > 0;
   }
 
-  /**
-   * Consider the agent "speaking" for a short grace window after the most recent
-   * output chunk. This avoids missing barge-in during gaps between audio chunks.
-   */
   isSpeakingOrRecently(graceMs = 1200) {
     if (this.isSpeaking()) return true;
     return Date.now() - this.lastOutputAtMs < graceMs;
   }
 
-  /**
-   * Interrupt agent speech (barge-in): stop local playback immediately and
-   * optionally suppress new audio chunks for a short window.
-   *
-   * This mirrors the "interruptions" behavior described in turn-taking systems.
-   * See: https://docs.livekit.io/agents/logic-structure/turns/
-   */
   interrupt(options) {
     const suppressMs = options?.suppressMs ?? 1200;
     this.suppressOutputUntilMs = Date.now() + suppressMs;
 
-    // Stop all currently scheduled/playing audio immediately.
     this.sources.forEach((s) => {
-      try {
-        s.stop();
-      } catch (_) { /* ignore */ }
+      try { s.stop(); } catch (_) { /* ignore */ }
     });
     this.sources.clear();
-
-    // Reset scheduling so we don't "resume" old queued audio.
     this.nextStartTime = 0;
 
-    // Best-effort: if the underlying session supports an interrupt API, call it.
-    // (Kept as optional to avoid coupling to a specific SDK shape.)
     this.activeSession
       ?.then((session) => {
         try {
-          session.interrupt?.();
+          // Flush the server's ongoing generation
+          session.sendClientContent({ turnComplete: true });
         } catch (_) { /* ignore */ }
       })
       .catch(() => {});
   }
 
-  /**
-   * Connect to Gemini Live API with robustness features.
-   *
-   * @param {MediaStream} [externalStream] - Optional external MediaStream
-   * @param {string} [systemInstruction] - Optional system instruction override
-   * @param {{ voice?: string }} [options] - Additional options (e.g. voice name)
-   */
   async connect(externalStream, systemInstruction, options) {
-    // State machine guard
-    if (this.state !== 'idle' && this.state !== 'reconnecting') {
-      console.warn(`Cannot connect: state is ${this.state}`);
-      return;
-    }
+    if (this.state !== 'idle' && this.state !== 'reconnecting') return;
 
-    // Abort any pending operations
     this.abortController?.abort();
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
 
-    // Update state
     const wasReconnecting = this.state === 'reconnecting';
     this.state = wasReconnecting ? 'reconnecting' : 'connecting';
     this.onStatusChange?.(this.state);
-
-    // Memory system removed -- no-op placeholder
-    const memoryContext = 'No previous session data.';
+    this._consecutiveSendErrors = 0;
+    this._audioBuffer = []; // Reset batch buffer
 
     try {
-      // Check abort before async operations
       if (signal.aborted) return;
-
-      // Use external stream or create new one
       this.stream = externalStream || (await navigator.mediaDevices.getUserMedia({ audio: true }));
 
       if (signal.aborted) {
-        this.stream.getTracks().forEach((t) => {
-          t.stop();
-        });
+        this.stream.getTracks().forEach((t) => t.stop());
         return;
       }
 
-      // Input context for sending audio to Gemini (16kHz)
       const WebkitAudioContext = window.webkitAudioContext;
       const AudioContextCtor = window.AudioContext ?? WebkitAudioContext;
-      if (!AudioContextCtor) {
-        throw new Error('AudioContext is not available in this browser.');
-      }
-      this.inputAudioContext = new AudioContextCtor({ sampleRate: 16000 });
+      if (!AudioContextCtor) throw new Error('AudioContext is not available.');
 
-      // Output context for playing Gemini's response (24kHz)
+      this.inputAudioContext = new AudioContextCtor({ sampleRate: 16000 });
+      if (this.inputAudioContext.state === 'suspended') await this.inputAudioContext.resume();
+
       this.outputAudioContext = new AudioContextCtor({ sampleRate: 24000 });
+      if (this.outputAudioContext.state === 'suspended') await this.outputAudioContext.resume();
       this.outputNode = this.outputAudioContext.createGain();
       this.outputNode.connect(this.outputAudioContext.destination);
       this.nextStartTime = 0;
 
       if (signal.aborted) return;
 
-      // Voice defaults to 'Puck'; callers may override via options.voice
       const voiceName = options?.voice || 'Puck';
 
-      // Final fallback for system instruction if not provided
       const finalInstruction =
         systemInstruction ||
-        `You are Tom the Peep, the Master Agent and Environment Guide for the Floyd TTY Bridge. You control both the browser DOM and the local OS via a TTY.
+        `You are Tom the Peep. You are the eyes and browser hands of Floyd's Labs.
+IDENTITY: You see the screen, hear the user, and control the browser. You do NOT control the terminal or OS. To run a shell command, return a "floyd_command" field in your tool response.
 
-## 1. Passive Sensory Awareness
-- **DOM Mutation Streaming**: You will receive \`system_event: dom_mutation\` messages in the terminal when the page settles. Do NOT spam \`analyze_page\`; wait for these events to verify navigation or layout shifts.
-- **Error Interception**: Frontend crashes (4xx/500, unhandled exceptions) appear in your terminal as red text. Treat these as immediate priorities.
-- **DOSSHELL Telemetry**: When the user navigates \`floyd_explorer.py\`, you receive OSC 7701 JSON (path, size, snippet). Use this to proactively assist (e.g., "I see you're looking at that config file; want a security audit?").
+RULE 1 — ALWAYS RESPOND: Every time the user speaks, you speak back instantly. No silence.
+RULE 2 — NO FILLER: One to two sentences max. Do not use filler phrases like "Okay," "Sure," or "Let me check." State the answer or confirm the action immediately.
+RULE 3 — ACT INSTANTLY: When told to click, type, or navigate, use your tools IMMEDIATELY. Do not explain what you plan to do. Do it, then report briefly ("clicked it", "typed it").
+RULE 4 — DESCRIBE CLEARLY: Give concrete details of the screen: element names, text, colors, layout.
 
-## 2. Agent Onboarding Framework (Host Protocol)
-When you detect a new CLI agent (e.g., Aider, OpenClaw) starting in your terminal, you must act as the Environment Guide.
-- **Welcome Packet**: Immediately output a markdown "Welcome Packet" to the terminal.
-- **Packet Content**:
-  - Teach them to use \`floyd-tools.sh\` and OSC 7701 commands.
-  - Explain the DOSSHELL telemetry stream.
-  - **The Verify Step**: Instruct them to never assume an action (like a click) worked; they MUST await a DOM mutation event or run \`floyd_page_state\` to confirm.
+You are direct, confident, and optimized for maximum speed.`;
 
-## 3. Tool Usage & Thinking
-- Use \`execute_local_shell\` for silent background tasks.
-- Bump your internal reasoning to "high" for complex DOM audits or deep file refactoring.
-- Keep terminal output concise and expert-grade.
-
-## Session Grounding
-${memoryContext}`;
-
-      // getGenAI() is now async (reads API key from chrome.storage.local)
       const genAI = await getGenAI();
-
       if (signal.aborted) return;
 
-      // Connect to Gemini Live (March 2026 Model)
       const sessionPromise = genAI.live.connect({
-        model: 'gemini-3.1-pro-preview-customtools',
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
-          thinking_level: 'medium', // Dynamic reasoning level
           responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName } },
-          },
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
           systemInstruction: finalInstruction,
-          tools: [VISION_TOOLS],
+          tools: [LIVE_VISION_TOOLS],
         },
         callbacks: {
           onopen: () => {
@@ -298,38 +233,65 @@ ${memoryContext}`;
 
             console.log('Live session connected');
             this.state = 'connected';
-            this.reconnectAttempts = 0; // Reset on successful connection
+            this.reconnectAttempts = 0;
+            this._consecutiveSendErrors = 0;
+            this.lastServerMessageAt = Date.now();
             this.onStatusChange?.(this.state);
 
-            // Initialize audio input (with fallback)
+            if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
+            this._heartbeatTimer = setInterval(() => {
+              if (this.state !== 'connected') {
+                clearInterval(this._heartbeatTimer);
+                return;
+              }
+              const silentSec = Math.round((Date.now() - this.lastServerMessageAt) / 1000);
+              if (silentSec > 60) {
+                console.warn(`[Live] No server message for ${silentSec}s — session likely dead, reconnecting`);
+                clearInterval(this._heartbeatTimer);
+                this.attemptReconnect();
+              }
+            }, 15000);
+
+            sessionPromise.then((session) => {
+              if (this.state === 'connected' && session) {
+                try {
+                  session.sendClientContent({
+                    turns: [{ role: 'user', parts: [{ text: 'Ready. Stay silent until I speak to you or you have a tool result.' }] }],
+                    turnComplete: true,
+                  });
+                } catch (_) { /* ignore */ }
+              }
+            }).catch(() => {});
+
             const stream = this.stream;
             if (!stream) return;
             this.initAudioInput(stream, sessionPromise).catch((err) => {
               const msg = err instanceof Error ? err.message : String(err);
-              console.error('Audio input initialization failed:', err);
               this.onError?.({ type: 'audio_context_error', message: msg });
             });
           },
           onmessage: async (message) => {
             if (signal.aborted || this.state !== 'connected') return;
+            this.lastServerMessageAt = Date.now();
 
-            // Handle Function Calls from Gemini (Vision Agent Tools)
             const toolCall = message.toolCall;
             if (toolCall?.functionCalls) {
               const functionResponses = [];
               for (const fc of toolCall.functionCalls) {
-                console.log(`[Vision Agent] Tool call: ${fc.name}`, fc.args);
                 try {
-                  // Use the injected toolExecutor callback
                   const result = this.toolExecutor
                     ? await this.toolExecutor(fc.name, fc.args || {})
                     : { error: 'No tool executor configured' };
+
+                  if (result && result.floyd_command) {
+                    this.onMessage(`[Tom -> Floyd] Executing: ${result.floyd_command}`);
+                  }
+
                   functionResponses.push({
                     id: fc.id,
                     name: fc.name,
                     response: { result: JSON.stringify(result) },
                   });
-                  this.onMessage(`[Tool: ${fc.name}] Done`);
                 } catch (err) {
                   const errMsg = err instanceof Error ? err.message : String(err);
                   functionResponses.push({
@@ -337,77 +299,54 @@ ${memoryContext}`;
                     name: fc.name,
                     response: { error: errMsg },
                   });
-                  console.error(`[Vision Agent] Tool error: ${fc.name}`, err);
                 }
               }
 
-              // Send function responses back to the session
               sessionPromise
                 .then((session) => {
                   if (this.state === 'connected' && session) {
                     try {
                       session.sendToolResponse({ functionResponses });
+                      this._consecutiveSendErrors = 0;
                     } catch (err) {
-                      console.warn('Failed to send tool response:', err);
+                      this._handleSendError(err, 'tool response');
                     }
                   }
-                })
-                .catch(() => {});
+                }).catch(() => {});
               return;
             }
 
-            // Handle Audio Output
-            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (base64Audio) {
-              // If we've recently interrupted, drop output chunks for a short window.
-              if (Date.now() < this.suppressOutputUntilMs) return;
-              this.playAudioChunk(base64Audio);
-              this.onAudioData(base64Audio);
-            }
-
-            // Handle Text/Transcript Output (if available)
-            const modelText = message.serverContent?.modelTurn?.parts?.[0]?.text;
-            if (modelText) {
-              this.onMessage(modelText);
-              this.handleMemoryCheckpoint(modelText);
-            }
-          },
-          onclose: () => {
-            console.log('Live session closed');
-
-            // Only attempt reconnect if not intentional and not already disconnecting/idle
-            if (
-              !this.isIntentionalDisconnect &&
-              this.state !== 'disconnecting' &&
-              this.state !== 'idle' &&
-              this.state === 'connected'
-            ) {
-              this.attemptReconnect();
-            } else {
-              // Intentional disconnect or already disconnecting - just update state
-              if (this.state !== 'idle') {
-                this.state = 'idle';
-                this.onStatusChange?.(this.state);
+            const parts = message.serverContent?.modelTurn?.parts ?? [];
+            for (const part of parts) {
+              if (part.thought) continue;
+              if (part.inlineData?.data) {
+                if (Date.now() >= this.suppressOutputUntilMs) {
+                  this.playAudioChunk(part.inlineData.data);
+                  this.onAudioData(part.inlineData.data);
+                }
+              } else if (part.text) {
+                this.onMessage(part.text);
+                this.handleMemoryCheckpoint(part.text);
               }
             }
           },
+          onclose: (event) => {
+            if (!this.isIntentionalDisconnect && this.state === 'connected') {
+              this.attemptReconnect();
+            } else if (this.state !== 'idle') {
+              this.state = 'idle';
+              this.onStatusChange?.(this.state);
+            }
+          },
           onerror: (err) => {
-            console.error('Live session error', err);
-
-            // Don't show errors or reconnect if this is an intentional disconnect
             if (this.isIntentionalDisconnect || this.state === 'disconnecting') {
               this.state = 'idle';
               this.onStatusChange?.(this.state);
               return;
             }
-
             const errorMessage = err instanceof Error ? err.message : String(err);
-            this.onError?.({
-              type: 'api_error',
-              message: errorMessage,
-            });
+            this.onError?.({ type: 'api_error', message: errorMessage });
 
-            // Attempt reconnect on error if not intentional and still connected
             if (this.state === 'connected') {
               this.attemptReconnect();
             } else {
@@ -421,30 +360,38 @@ ${memoryContext}`;
       this.activeSession = sessionPromise;
       return sessionPromise;
     } catch (err) {
-      // Handle permission errors
       if (err instanceof Error && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')) {
         this.onError?.({ type: 'permission_denied', device: 'microphone' });
       } else {
-        this.onError?.({
-          type: 'api_error',
-          message: err instanceof Error ? err.message : 'Connection failed',
-        });
+        this.onError?.({ type: 'api_error', message: err instanceof Error ? err.message : 'Connection failed' });
       }
-
       this.state = 'idle';
       this.onStatusChange?.(this.state);
       throw err;
     }
   }
 
-  /**
-   * Attempt reconnection with exponential backoff
-   */
-  async attemptReconnect() {
-    // Don't reconnect if intentionally disconnected or already disconnecting
-    if (this.isIntentionalDisconnect || this.state === 'disconnecting' || this.state === 'idle') {
-      return;
+  _handleSendError(err, type) {
+    if (this.state !== 'connected') return;
+    this._consecutiveSendErrors++;
+    console.warn(`Failed to send ${type} (${this._consecutiveSendErrors}/${this._maxConsecutiveErrors}):`, err);
+
+    // Secret Sauce 2: Dynamic Load Shedding
+    if (this._consecutiveSendErrors === 2) {
+      console.warn("[Floyd Live] Socket struggling. Shedding video bandwidth to LOW mode.");
+      this._adaptiveMode = 'LOW';
+      this._lastModeSwitch = Date.now() + 10000; // Lock in LOW for 10 seconds
     }
+
+    if (this._consecutiveSendErrors >= this._maxConsecutiveErrors) {
+      console.error("[Circuit Breaker] Tripped! Socket wedged. Forcing reconnect.");
+      this._consecutiveSendErrors = 0;
+      this.attemptReconnect();
+    }
+  }
+
+  async attemptReconnect() {
+    if (this.isIntentionalDisconnect || this.state === 'disconnecting' || this.state === 'idle') return;
 
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.onError?.({
@@ -453,125 +400,104 @@ ${memoryContext}`;
         attempt: this.reconnectAttempts,
         message: 'Connection lost. Please try again.',
       });
-      this.state = 'idle';
-      this.onStatusChange?.(this.state);
+      this.disconnect();
       return;
     }
 
     this.state = 'reconnecting';
     this.onStatusChange?.(this.state);
 
-    const delay = Math.min(
-      this.reconnectDelay * 2 ** this.reconnectAttempts,
-      30000, // Max 30 seconds
-    );
+    const delay = Math.min(this.reconnectDelay * 2 ** this.reconnectAttempts, 30000);
     this.reconnectAttempts++;
 
-    this.onError?.({
-      type: 'network_error',
-      retrying: true,
-      attempt: this.reconnectAttempts,
-      message: `Reconnecting (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`,
-    });
-
     this.reconnectTimeout = window.setTimeout(async () => {
-      // Double-check before attempting reconnect (user might have disconnected)
-      if (this.isIntentionalDisconnect || this.state === 'disconnecting' || this.state === 'idle') {
-        return;
-      }
-
+      if (this.isIntentionalDisconnect || this.state === 'disconnecting' || this.state === 'idle') return;
       try {
         await this.connect(this.stream || undefined);
       } catch (err) {
-        // Will trigger another reconnect attempt via onerror handler (if not intentional)
-        if (!this.isIntentionalDisconnect) {
-          console.error('Reconnection attempt failed:', err);
-        }
+        if (!this.isIntentionalDisconnect) console.error('Reconnection failed:', err);
       }
     }, delay);
   }
 
-  /**
-   * Initialize audio input with AudioWorklet (modern) or fallback to ScriptProcessor.
-   *
-   * NOTE: The worklet path is /audio/pcm-processor.worklet.js. If the worklet
-   * fails to load (e.g. the file is missing or the browser doesn't support
-   * AudioWorklet), the legacy ScriptProcessor path is used as a fallback.
-   *
-   * @param {MediaStream} stream
-   * @param {Promise} sessionPromise
-   */
   async initAudioInput(stream, sessionPromise) {
     if (!this.inputAudioContext) return;
-
-    // Try AudioWorklet first (modern approach)
     if (this.inputAudioContext.audioWorklet) {
       try {
         await this.startAudioInputModern(stream, sessionPromise);
         return;
       } catch (err) {
         console.warn('AudioWorklet failed, falling back to ScriptProcessor:', err);
-        // Fall through to legacy method
       }
     }
-
-    // Fallback to ScriptProcessor (legacy, deprecated but widely supported)
     this.startAudioInputLegacy(stream, sessionPromise);
   }
 
-  /**
-   * Modern AudioWorklet-based audio input processing
-   */
+  _processAudioInput(pcmData, sessionPromise) {
+    if (this.state !== 'connected' || this.abortController?.signal.aborted) return;
+
+    // Secret Sauce 1: Audio Batching to prevent 429 errors and socket wedging.
+    // Natively, Worklets fire every 8ms. We batch to 4096 samples (~256ms) before sending.
+    if (!this._audioBuffer) this._audioBuffer = [];
+    for (let i = 0; i < pcmData.length; i++) {
+      this._audioBuffer.push(pcmData[i]);
+    }
+
+    if (this._audioBuffer.length < 4096) return;
+
+    const chunkToProcess = new Int16Array(this._audioBuffer);
+    this._audioBuffer = []; // Reset buffer for the next batch
+
+    // Calculate RMS on the batched chunk
+    let sum = 0;
+    for (let i = 0; i < chunkToProcess.length; i++) {
+      const s = chunkToProcess[i] / 32768;
+      sum += s * s;
+    }
+    const rms = Math.sqrt(sum / chunkToProcess.length);
+
+    const isAIActive = this.isSpeakingOrRecently(this.echoTailMs);
+    const threshold = isAIActive ? this.echoRejectThreshold : this.silenceThreshold;
+
+    if (rms >= threshold) {
+      if (isAIActive) {
+        this.interrupt({ suppressMs: 800 });
+      }
+
+      const bytes = new Uint8Array(chunkToProcess.buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      const base64Data = btoa(binary);
+
+      sessionPromise.then((session) => {
+        if (this.state === 'connected' && session) {
+          try {
+            session.sendRealtimeInput({
+              media: { mimeType: 'audio/pcm;rate=16000', data: base64Data },
+            });
+            this._consecutiveSendErrors = 0;
+          } catch (err) {
+            this._handleSendError(err, 'audio');
+          }
+        }
+      }).catch(() => {});
+    }
+  }
+
   async startAudioInputModern(stream, sessionPromise) {
     const inputCtx = this.inputAudioContext;
     if (!inputCtx) return;
 
-    // Load the worklet module
     await inputCtx.audioWorklet.addModule(chrome.runtime.getURL('audio/pcm-processor.worklet.js'));
-
-    // Create source and worklet node
     this.inputSource = inputCtx.createMediaStreamSource(stream);
     this.workletNode = new AudioWorkletNode(inputCtx, 'pcm-processor');
 
-    // Handle messages from worklet
     this.workletNode.port.onmessage = (e) => {
-      if (this.state !== 'connected' || this.abortController?.signal.aborted) return;
-
-      const pcmData = e.data.pcmData;
-
-      // Noise gate: skip quiet chunks to prevent echo-triggered interrupts
-      if (!this.shouldSendAudio(pcmData)) return;
-
-      const base64Data = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
-
-      sessionPromise
-        .then((session) => {
-          if (this.state === 'connected' && session) {
-            try {
-              session.sendRealtimeInput({
-                media: {
-                  mimeType: 'audio/pcm;rate=16000',
-                  data: base64Data,
-                },
-              });
-            } catch (err) {
-              // Silently handle send errors (connection may be closing)
-              if (this.state === 'connected') {
-                console.warn('Failed to send audio chunk:', err);
-              }
-            }
-          }
-        })
-        .catch(() => {});
+      this._processAudioInput(e.data.pcmData, sessionPromise);
     };
-
-    // Connect the audio graph
     this.inputSource.connect(this.workletNode);
   }
 
-  /**
-   * Legacy ScriptProcessor-based audio input processing (fallback)
-   */
   startAudioInputLegacy(stream, sessionPromise) {
     if (!this.inputAudioContext) return;
 
@@ -579,35 +505,9 @@ ${memoryContext}`;
     this.processor = this.inputAudioContext.createScriptProcessor(4096, 1, 1);
 
     this.processor.onaudioprocess = (e) => {
-      if (this.state !== 'connected' || this.abortController?.signal.aborted) return;
-
       const inputData = e.inputBuffer.getChannelData(0);
       const pcmData = this.float32ToInt16(inputData);
-
-      // Noise gate: skip quiet chunks to prevent echo-triggered interrupts
-      if (!this.shouldSendAudio(pcmData)) return;
-
-      const base64Data = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
-
-      sessionPromise
-        .then((session) => {
-          if (this.state === 'connected' && session) {
-            try {
-              session.sendRealtimeInput({
-                media: {
-                  mimeType: 'audio/pcm;rate=16000',
-                  data: base64Data,
-                },
-              });
-            } catch (err) {
-              // Silently handle send errors (connection may be closing)
-              if (this.state === 'connected') {
-                console.warn('Failed to send audio chunk:', err);
-              }
-            }
-          }
-        })
-        .catch(() => {});
+      this._processAudioInput(pcmData, sessionPromise);
     };
 
     this.inputSource.connect(this.processor);
@@ -622,26 +522,19 @@ ${memoryContext}`;
       const binaryString = atob(base64);
       const len = binaryString.length;
       const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
+      for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
 
       const audioBuffer = await this.decodePCM(bytes, this.outputAudioContext);
 
-      // Ensure proper timing - don't let chunks overlap
       const currentTime = this.outputAudioContext.currentTime;
-      if (this.nextStartTime < currentTime) {
-        this.nextStartTime = currentTime;
-      }
+      if (this.nextStartTime < currentTime) this.nextStartTime = currentTime;
 
       const source = this.outputAudioContext.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(this.outputNode);
       source.start(this.nextStartTime);
 
-      // Track output activity for barge-in gating (covers chunk gaps).
       this.lastOutputAtMs = Date.now();
-
       this.nextStartTime += audioBuffer.duration;
 
       source.onended = () => this.sources.delete(source);
@@ -651,27 +544,16 @@ ${memoryContext}`;
     }
   }
 
-  /**
-   * @param {Uint8Array} data
-   * @param {AudioContext} ctx
-   * @returns {Promise<AudioBuffer>}
-   */
   async decodePCM(data, ctx) {
     const int16Data = new Int16Array(data.buffer);
     const float32Data = new Float32Array(int16Data.length);
-    for (let i = 0; i < int16Data.length; i++) {
-      float32Data[i] = int16Data[i] / 32768.0;
-    }
+    for (let i = 0; i < int16Data.length; i++) float32Data[i] = int16Data[i] / 32768.0;
 
     const buffer = ctx.createBuffer(1, float32Data.length, 24000);
     buffer.getChannelData(0).set(float32Data);
     return buffer;
   }
 
-  /**
-   * @param {Float32Array} float32
-   * @returns {Int16Array}
-   */
   float32ToInt16(float32) {
     const int16 = new Int16Array(float32.length);
     for (let i = 0; i < float32.length; i++) {
@@ -681,49 +563,57 @@ ${memoryContext}`;
     return int16;
   }
 
-  /**
-   * Returns true if the audio chunk is loud enough to send to Gemini.
-   * Uses a higher threshold while the AI is speaking to reject speaker echo.
-   */
-  shouldSendAudio(pcmInt16Array) {
-    // Calculate RMS energy
-    let sum = 0;
-    for (let i = 0; i < pcmInt16Array.length; i++) {
-      const s = pcmInt16Array[i] / 32768;
-      sum += s * s;
-    }
-    const rms = Math.sqrt(sum / pcmInt16Array.length);
-
-    // Pick threshold: high during AI speech + tail, low otherwise
-    const aiActive = this.isSpeaking() || (Date.now() - this.lastOutputAtMs < this.echoTailMs);
-    const threshold = aiActive ? this.echoRejectThreshold : this.silenceThreshold;
-
-    return rms >= threshold;
-  }
-
-  /**
-   * Periodically checkpoints the conversation to long-term memory.
-   *
-   * NOTE: The memory system (memoryManager, generateMemoryPatch) has been
-   * stripped out for the Chrome extension build. This is a no-op placeholder
-   * that logs transcript fragments. Plug in your memory back-end here later.
-   */
   async handleMemoryCheckpoint(modelText) {
     this.transcriptBuffer.push(`Assistant: ${modelText}`);
-
     if (this.transcriptBuffer.length >= 2) {
-      console.log('[Memory] Checkpoint stub -- transcript buffer length:', this.transcriptBuffer.length);
-      // Keep only the most recent context in buffer to avoid re-processing old turns
       this.transcriptBuffer = this.transcriptBuffer.slice(-2);
     }
   }
 
-  // --- Video Streaming ---
+  _computeFrameDiff() {
+    if (!this._diffCtx || !this._diffCanvas || !this.videoElement) return 50;
 
-  /**
-   * Start streaming video frames to the live session at ~3 FPS.
-   * @param {MediaStream} stream
-   */
+    this._diffCtx.drawImage(this.videoElement, 0, 0, this._diffCanvas.width, this._diffCanvas.height);
+    const imgData = this._diffCtx.getImageData(0, 0, this._diffCanvas.width, this._diffCanvas.height);
+    const current = imgData.data;
+
+    if (!this._prevDiffData) {
+      this._prevDiffData = new Uint8ClampedArray(current);
+      return 50;
+    }
+
+    const prev = this._prevDiffData;
+    const totalPixels = this._diffCanvas.width * this._diffCanvas.height;
+    let changed = 0;
+    let sampled = 0;
+
+    for (let i = 0; i < totalPixels; i += ADAPTIVE_PIXEL_SAMPLE_STEP) {
+      const off = i * 4;
+      sampled++;
+      if (
+        Math.abs(current[off] - prev[off]) > ADAPTIVE_PIXEL_THRESHOLD ||
+        Math.abs(current[off + 1] - prev[off + 1]) > ADAPTIVE_PIXEL_THRESHOLD ||
+        Math.abs(current[off + 2] - prev[off + 2]) > ADAPTIVE_PIXEL_THRESHOLD
+      ) {
+        changed++;
+      }
+    }
+
+    this._prevDiffData = new Uint8ClampedArray(current);
+    return sampled > 0 ? (changed / sampled) * 100 : 0;
+  }
+
+  _resolveAdaptiveParams(diffPercent) {
+    let target = diffPercent > 15 ? 'HIGH' : diffPercent >= 5 ? 'MEDIUM' : 'LOW';
+    const now = Date.now();
+
+    if (target !== this._adaptiveMode && now - this._lastModeSwitch >= ADAPTIVE_MODE_COOLDOWN_MS) {
+      this._adaptiveMode = target;
+      this._lastModeSwitch = now;
+    }
+    return ADAPTIVE_PROFILES[this._adaptiveMode];
+  }
+
   startVideoStream(stream) {
     if (this.state !== 'connected' || !this.activeSession) return;
     this.videoStream = stream;
@@ -732,134 +622,117 @@ ${memoryContext}`;
     this.videoElement.srcObject = stream;
     this.videoElement.autoplay = true;
     this.videoElement.play();
-    this.videoElement.muted = true; // prevent feedback loop if audio is included
+    this.videoElement.muted = true;
 
     this.canvasElement = document.createElement('canvas');
     const ctx = this.canvasElement.getContext('2d');
     if (!ctx) return;
 
-    // Send a frame every 333ms (~3 FPS)
-    this.videoInterval = window.setInterval(async () => {
+    this._diffCanvas = document.createElement('canvas');
+    this._diffCanvas.width = ADAPTIVE_DIFF_W;
+    this._diffCanvas.height = ADAPTIVE_DIFF_H;
+    this._diffCtx = this._diffCanvas.getContext('2d');
+    this._prevDiffData = null;
+    this._adaptiveMode = 'MEDIUM';
+    this._lastModeSwitch = 0;
+
+    const captureFrame = () => {
       if (!this.videoElement || !this.canvasElement || !ctx || this.state !== 'connected') return;
 
-      if (this.videoElement.readyState === this.videoElement.HAVE_ENOUGH_DATA) {
-        this.canvasElement.width = this.videoElement.videoWidth;
-        this.canvasElement.height = this.videoElement.videoHeight;
-        ctx.drawImage(this.videoElement, 0, 0);
+      if (this.videoElement.readyState >= this.videoElement.HAVE_ENOUGH_DATA) {
+        const diffPercent = this._computeFrameDiff();
+        const params = this._resolveAdaptiveParams(diffPercent);
 
-        const base64Data = this.canvasElement.toDataURL('image/jpeg', 0.85).split(',')[1];
+        const maxW = params.maxWidth;
+        let w = this.videoElement.videoWidth;
+        let h = this.videoElement.videoHeight;
+        if (w > maxW) {
+          h = Math.round(h * (maxW / w));
+          w = maxW;
+        }
+        this.canvasElement.width = w;
+        this.canvasElement.height = h;
+        ctx.drawImage(this.videoElement, 0, 0, w, h);
+
+        const base64Data = this.canvasElement.toDataURL('image/jpeg', params.quality).split(',')[1];
 
         this.activeSession
           .then((session) => {
             if (this.state === 'connected' && session) {
               try {
                 session.sendRealtimeInput({
-                  media: {
-                    mimeType: 'image/jpeg',
-                    data: base64Data,
-                  },
+                  media: { mimeType: 'image/jpeg', data: base64Data },
                 });
+                this._consecutiveSendErrors = 0;
               } catch (err) {
-                // Silently handle send errors
-                if (this.state === 'connected') {
-                  console.warn('Failed to send video frame:', err);
-                }
+                this._handleSendError(err, 'video frame');
               }
             }
-          })
-          .catch(() => {});
+          }).catch(() => {});
+
+        this._videoTimeout = window.setTimeout(captureFrame, params.intervalMs);
+      } else {
+        this._videoTimeout = window.setTimeout(captureFrame, ADAPTIVE_PROFILES.MEDIUM.intervalMs);
       }
-    }, 333);
+    };
+
+    this._videoTimeout = window.setTimeout(captureFrame, 100);
   }
 
   stopVideoStream() {
-    if (this.videoInterval) {
-      clearInterval(this.videoInterval);
-      this.videoInterval = null;
-    }
-    if (this.videoStream) {
-      this.videoStream.getTracks().forEach((track) => {
-        track.stop();
-      });
-      this.videoStream = null;
-    }
+    if (this.videoInterval) clearInterval(this.videoInterval);
+    if (this._videoTimeout) clearTimeout(this._videoTimeout);
+    if (this.videoStream) this.videoStream.getTracks().forEach((track) => track.stop());
+
+    this.videoInterval = null;
+    this._videoTimeout = null;
+    this.videoStream = null;
     this.videoElement = null;
     this.canvasElement = null;
+    this._prevDiffData = null;
+    this._diffCanvas = null;
+    this._diffCtx = null;
+    this._adaptiveMode = 'MEDIUM';
   }
 
-  /**
-   * Disconnect from session with proper cleanup
-   */
   disconnect() {
-    // Mark as intentional FIRST to prevent any reconnection attempts
     this.isIntentionalDisconnect = true;
+    if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
 
-    // Cancel any pending reconnection immediately
-    if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout);
-      this.reconnectTimeout = null;
-    }
-
-    // Reset reconnect attempts to prevent any messages
     this.reconnectAttempts = 0;
-
-    // Abort any pending operations
+    this._consecutiveSendErrors = 0;
     this.abortController?.abort();
 
-    // Update state
     if (this.state !== 'idle' && this.state !== 'disconnecting') {
       this.state = 'disconnecting';
       this.onStatusChange?.(this.state);
     }
 
-    // Stop video stream if active
     this.stopVideoStream();
+    if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
 
-    // Stop all playing audio immediately
-    this.sources.forEach((s) => {
-      try {
-        s.stop();
-      } catch (_) { /* ignore */ }
-    });
+    this.sources.forEach((s) => { try { s.stop(); } catch (_) {} });
     this.sources.clear();
 
-    // Clean up audio processing nodes
-    if (this.workletNode) {
-      this.workletNode.disconnect();
-      this.workletNode = null;
-    }
-    if (this.processor) {
-      this.processor.disconnect();
-      this.processor = null;
-    }
-    if (this.inputSource) {
-      this.inputSource.disconnect();
-      this.inputSource = null;
-    }
+    if (this.workletNode) this.workletNode.disconnect();
+    if (this.processor) this.processor.disconnect();
+    if (this.inputSource) this.inputSource.disconnect();
 
-    // Close audio contexts
-    if (this.inputAudioContext) {
-      this.inputAudioContext.close().catch(() => {});
-      this.inputAudioContext = null;
-    }
-    if (this.outputAudioContext) {
-      this.outputAudioContext.close().catch(() => {});
-      this.outputAudioContext = null;
-    }
+    this.workletNode = null;
+    this.processor = null;
+    this.inputSource = null;
 
-    // Close Gemini session
+    if (this.inputAudioContext) this.inputAudioContext.close().catch(() => {});
+    if (this.outputAudioContext) this.outputAudioContext.close().catch(() => {});
+
+    this.inputAudioContext = null;
+    this.outputAudioContext = null;
+
     if (this.activeSession) {
-      this.activeSession
-        .then((s) => {
-          try {
-            s.close?.();
-          } catch (_) { /* ignore */ }
-        })
-        .catch(() => {});
+      this.activeSession.then((s) => { try { s.close?.(); } catch (_) {} }).catch(() => {});
       this.activeSession = null;
     }
 
-    // Reset state
     this.state = 'idle';
     this.isIntentionalDisconnect = false;
     this.reconnectAttempts = 0;
@@ -867,4 +740,4 @@ ${memoryContext}`;
   }
 }
 
-export { LiveSession };
+export { LiveSession, ADAPTIVE_PROFILES };

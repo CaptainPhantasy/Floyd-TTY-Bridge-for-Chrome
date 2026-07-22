@@ -12,6 +12,67 @@
   window.__TOM_EXTENSION_ID__ = chrome.runtime.id;
   window.dispatchEvent(new CustomEvent('tom-extension-ready'));
 
+  // Initialize DOM change observer (from dom-observer.js, loaded as content_script)
+  if (typeof initDomObserver === 'function') initDomObserver();
+
+  // =========================================================================
+  // Console Capture Ring Buffer
+  // =========================================================================
+  const _consoleBuffer = [];
+  const _CONSOLE_BUFFER_MAX = 200;
+  const _origConsoleLog = console.log;
+  const _origConsoleWarn = console.warn;
+  const _origConsoleError = console.error;
+  const _pageDomain = (window.location && window.location.hostname) || '';
+
+  function _isFromExtension() {
+    try {
+      const stack = (new Error()).stack || '';
+      // Skip our wrapper frames: Error, _isFromExtension, _captureConsole, console.X
+      const callerLines = stack.split('\n').slice(4);
+      return callerLines.length > 0 && callerLines[0].includes('chrome-extension://');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function _captureConsole(level, args) {
+    // Domain filtering: skip messages originating from extension code
+    if (_isFromExtension()) return;
+    // Only capture when running on a real page (skip about:blank, etc.)
+    if (!_pageDomain) return;
+
+    const message = Array.from(args).map(a => {
+      try { return String(a); } catch (e) { return '[unstringifiable]'; }
+    }).join(' ').substring(0, 2000);
+
+    _consoleBuffer.push({
+      level,
+      timestamp: Date.now(),
+      message,
+      source: ''
+    });
+
+    if (_consoleBuffer.length > _CONSOLE_BUFFER_MAX) {
+      _consoleBuffer.shift();
+    }
+  }
+
+  console.log = function(...args) {
+    _captureConsole('log', args);
+    return _origConsoleLog.apply(console, args);
+  };
+
+  console.warn = function(...args) {
+    _captureConsole('warn', args);
+    return _origConsoleWarn.apply(console, args);
+  };
+
+  console.error = function(...args) {
+    _captureConsole('error', args);
+    return _origConsoleError.apply(console, args);
+  };
+
   // =========================================================================
   // Helper Functions
   // =========================================================================
@@ -195,6 +256,35 @@
   }
   function safeQueryAll(selector) {
     try { return Array.from(document.querySelectorAll(selector)); } catch (_) { return []; }
+  }
+
+  function missingRequiredParameter(name) {
+    return { error: 'Missing required parameter: ' + name };
+  }
+
+  function getNonEmptyStringArg(args, name) {
+    if (!args || typeof args[name] !== 'string' || args[name].trim() === '') {
+      return { error: missingRequiredParameter(name) };
+    }
+    return { value: args[name] };
+  }
+
+  function hasNumericArg(args, name) {
+    if (!args || typeof args[name] !== 'number' || Number.isNaN(args[name])) {
+      return { error: missingRequiredParameter(name) };
+    }
+    return { value: args[name] };
+  }
+
+  function hasArrayArg(args, name) {
+    if (!args || !Array.isArray(args[name])) {
+      return { error: missingRequiredParameter(name) };
+    }
+    return { value: args[name] };
+  }
+
+  function isValidNavigationUrl(url) {
+    return typeof url === 'string' && /^(https?:\/\/|chrome:\/\/)/.test(url);
   }
 
   /** Get label text for a form input. */
@@ -460,7 +550,9 @@
 
   // ---- 2. analyze_element ----
   async function analyzeElement(args) {
-    const selector = args.selector;
+    const selectorArg = getNonEmptyStringArg(args, 'selector');
+    if (selectorArg.error) return selectorArg.error;
+    const selector = selectorArg.value;
     const el = safeQuery(selector);
     if (!el) return { error: 'Element not found: ' + selector };
 
@@ -518,9 +610,11 @@
 
   // ---- 3. find_elements ----
   async function findElements(args) {
-    const query = (args.query || '').toLowerCase();
+    const queryArg = getNonEmptyStringArg(args, 'query');
+    if (queryArg.error) return queryArg.error;
+    const query = queryArg.value.toLowerCase();
     const searchBy = args.search_by || 'any';
-    const limit = args.limit || 10;
+    const limit = Math.min(typeof args.limit === 'number' && args.limit > 0 ? args.limit : 10, 100);
 
     const allEls = safeQueryAll('*');
     const results = [];
@@ -694,7 +788,9 @@
 
   // ---- 5. extract_css ----
   async function extractCss(args) {
-    const selector = args.selector;
+    const selectorArg = getNonEmptyStringArg(args, 'selector');
+    if (selectorArg.error) return selectorArg.error;
+    const selector = selectorArg.value;
     const el = safeQuery(selector);
     if (!el) return { error: 'Element not found: ' + selector };
 
@@ -736,11 +832,15 @@
 
   // ---- 7. extract_text ----
   async function extractText(args) {
-    const selector = args.selector;
+    const selectorArg = getNonEmptyStringArg(args, 'selector');
+    if (selectorArg.error) return selectorArg.error;
+    const selector = selectorArg.value;
     const els = safeQueryAll(selector);
     if (els.length === 0) return { error: 'No elements found: ' + selector };
 
-    const results = els.slice(0, 50).map(el => ({
+    const limit = Math.min(typeof args.limit === 'number' && args.limit > 0 ? args.limit : 50, 100);
+
+    const results = els.slice(0, limit).map(el => ({
       selector: selectorOf(el),
       text: textOf(el, 500),
       visible: isVisible(el),
@@ -768,7 +868,9 @@
 
   // ---- 9. click_element ----
   async function clickElement(args) {
-    const selector = args.selector;
+    const selectorArg = getNonEmptyStringArg(args, 'selector');
+    if (selectorArg.error) return selectorArg.error;
+    const selector = selectorArg.value;
     const el = safeQuery(selector);
     if (!el) return { error: 'Element not found: ' + selector };
 
@@ -790,7 +892,9 @@
 
   // ---- 10. scroll_to ----
   async function scrollTo(args) {
-    const target = args.target;
+    const targetArg = getNonEmptyStringArg(args, 'target');
+    if (targetArg.error) return targetArg.error;
+    const target = targetArg.value;
     let desc = '';
 
     if (target === 'top') {
@@ -822,24 +926,35 @@
 
   // ---- 11. navigate_to ----
   async function navigateTo(args) {
-    const url = args.url;
+    const urlArg = getNonEmptyStringArg(args, 'url');
+    if (urlArg.error) return urlArg.error;
+    const url = urlArg.value;
+    if (!isValidNavigationUrl(url)) return { error: 'Invalid URL format: ' + url };
     window.location.href = url;
     return { navigating_to: url };
   }
 
   // ---- 12. open_tab ----
   async function openTab(args) {
-    return delegateToBackground('open_tab', { url: args.url });
+    const urlArg = getNonEmptyStringArg(args, 'url');
+    if (urlArg.error) return urlArg.error;
+    const url = urlArg.value;
+    if (!isValidNavigationUrl(url)) return { error: 'Invalid URL format: ' + url };
+    return delegateToBackground('open_tab', { url: url });
   }
 
   // ---- 13. close_tab ----
   async function closeTab(args) {
-    return delegateToBackground('close_tab', { tab_id: args.tab_id });
+    const tabIdArg = hasNumericArg(args, 'tab_id');
+    if (tabIdArg.error) return tabIdArg.error;
+    return delegateToBackground('close_tab', { tab_id: tabIdArg.value });
   }
 
   // ---- 14. switch_tab ----
   async function switchTab(args) {
-    return delegateToBackground('switch_tab', { tab_id: args.tab_id });
+    const tabIdArg = hasNumericArg(args, 'tab_id');
+    if (tabIdArg.error) return tabIdArg.error;
+    return delegateToBackground('switch_tab', { tab_id: tabIdArg.value });
   }
 
   // ---- 15. list_tabs ----
@@ -849,7 +964,9 @@
 
   // ---- 16. type_text ----
   async function typeText(args) {
-    const selector = args.selector;
+    const selectorArg = getNonEmptyStringArg(args, 'selector');
+    if (selectorArg.error) return selectorArg.error;
+    const selector = selectorArg.value;
     const el = safeQuery(selector);
     if (!el) return { error: 'Element not found: ' + selector };
 
@@ -869,7 +986,9 @@
 
   // ---- 17. fill_form ----
   async function fillForm(args) {
-    const fields = args.fields || [];
+    const fieldsArg = hasArrayArg(args, 'fields');
+    if (fieldsArg.error) return fieldsArg.error;
+    const fields = fieldsArg.value;
     const results = [];
 
     for (const field of fields) {
@@ -890,7 +1009,12 @@
 
   // ---- 18. select_option ----
   async function selectOption(args) {
-    const selector = args.selector;
+    const selectorArg = getNonEmptyStringArg(args, 'selector');
+    if (selectorArg.error) return selectorArg.error;
+    const valueArg = getNonEmptyStringArg(args, 'value');
+    if (valueArg.error) return valueArg.error;
+    const selector = selectorArg.value;
+    const value = valueArg.value;
     const el = safeQuery(selector);
     if (!el || el.tagName.toLowerCase() !== 'select') {
       return { error: 'Select element not found: ' + selector };
@@ -899,7 +1023,7 @@
     let found = false;
     // Try by value first
     for (const opt of el.options) {
-      if (opt.value === args.value) {
+      if (opt.value === value) {
         el.value = opt.value;
         found = true;
         break;
@@ -908,7 +1032,7 @@
     // Then by text
     if (!found) {
       for (const opt of el.options) {
-        if (opt.textContent.trim() === args.value) {
+        if (opt.textContent.trim() === value) {
           el.value = opt.value;
           found = true;
           break;
@@ -916,7 +1040,7 @@
       }
     }
 
-    if (!found) return { error: 'Option not found: ' + args.value };
+    if (!found) return { error: 'Option not found: ' + value };
 
     el.dispatchEvent(new Event('change', { bubbles: true }));
     return {
@@ -933,8 +1057,10 @@
 
   // ---- 20. wait_for_element ----
   async function waitForElement(args) {
-    const selector = args.selector;
-    const timeout = args.timeout || 5000;
+    const selectorArg = getNonEmptyStringArg(args, 'selector');
+    if (selectorArg.error) return selectorArg.error;
+    const selector = selectorArg.value;
+    const timeout = Math.min(typeof args.timeout === 'number' && args.timeout > 0 ? args.timeout : 5000, 30000);
     const interval = 100;
     const start = Date.now();
 
@@ -968,47 +1094,57 @@
 
   // ---- 22. write_observation ----
   async function writeObservation(args) {
-    const analysis = await analyzePage(args);
+    let md = '';
+    let analysis = null;
     const timestamp = new Date().toISOString();
 
-    // Format as markdown
-    let md = '# Page Observation\n\n';
-    md += '- **URL:** ' + analysis.url + '\n';
-    md += '- **Title:** ' + analysis.title + '\n';
-    md += '- **Timestamp:** ' + timestamp + '\n';
-    md += '- **Score:** ' + analysis.score + '/100\n';
-    md += '- **Viewport:** ' + analysis.viewport.width + 'x' + analysis.viewport.height + '\n\n';
-
-    md += '## Landmarks\n';
-    for (const [name, sels] of Object.entries(analysis.landmarks)) {
-      md += '- **' + name + ':** ' + sels.join(', ') + '\n';
-    }
-
-    md += '\n## Headings (' + analysis.headings.length + ')\n';
-    for (const h of analysis.headings) {
-      md += '- h' + h.level + ': ' + h.text + '\n';
-    }
-
-    md += '\n## Interactive Elements (' + analysis.interactive_elements.length + ')\n';
-    for (const ie of analysis.interactive_elements.slice(0, 20)) {
-      md += '- [' + ie.tag + '] ' + (ie.text || ie.aria_label || ie.selector).substring(0, 60) + '\n';
-    }
-
-    if (analysis.technical_issues.length > 0) {
-      md += '\n## Technical Issues\n';
-      for (const ti of analysis.technical_issues) {
-        md += '- ' + ti + '\n';
+    if (args.type === 'verification_report') {
+      // Use the verification protocol formatter
+      if (window.__floydVerification) {
+        md = window.__floydVerification.formatVerificationReport(args);
+      } else {
+        md = `### Verification Report: ${args.claim_id}\n- Status: ${args.status}\n- Claim: ${args.claim_text}\n\n`;
       }
-    }
+    } else {
+      analysis = await analyzePage(args);
+      // Format as markdown
+      md = '# Page Observation\n\n';
+      md += '- **URL:** ' + analysis.url + '\n';
+      md += '- **Title:** ' + analysis.title + '\n';
+      md += '- **Timestamp:** ' + timestamp + '\n';
+      md += '- **Score:** ' + analysis.score + '/100\n';
+      md += '- **Viewport:** ' + analysis.viewport.width + 'x' + analysis.viewport.height + '\n\n';
 
-    if (analysis.contrast_issues.length > 0) {
-      md += '\n## Contrast Issues\n';
-      for (const ci of analysis.contrast_issues) {
-        md += '- ' + ci.element + ': ratio ' + ci.ratio + ':1 (need ' + ci.required + ':1)\n';
+      md += '## Landmarks\n';
+      for (const [name, sels] of Object.entries(analysis.landmarks)) {
+        md += '- **' + name + ':** ' + sels.join(', ') + '\n';
       }
-    }
 
-    md += '\n---\n';
+      md += '\n## Headings (' + analysis.headings.length + ')\n';
+      for (const h of analysis.headings) {
+        md += '- h' + h.level + ': ' + h.text + '\n';
+      }
+
+      md += '\n## Interactive Elements (' + analysis.interactive_elements.length + ')\n';
+      for (const ie of analysis.interactive_elements.slice(0, 20)) {
+        md += '- [' + ie.tag + '] ' + (ie.text || ie.aria_label || ie.selector).substring(0, 60) + '\n';
+      }
+
+      if (analysis.technical_issues.length > 0) {
+        md += '\n## Technical Issues\n';
+        for (const ti of analysis.technical_issues) {
+          md += '- ' + ti + '\n';
+        }
+      }
+
+      if (analysis.contrast_issues.length > 0) {
+        md += '\n## Contrast Issues\n';
+        for (const ci of analysis.contrast_issues) {
+          md += '- ' + ci.element + ': ratio ' + ci.ratio + ':1 (need ' + ci.required + ':1)\n';
+        }
+      }
+      md += '\n---\n';
+    }
 
     // Store in localStorage
     try {
@@ -1071,12 +1207,19 @@
 
   // ---- 24. query_knowledge ----
   async function queryKnowledge(args) {
+    const queryArg = getNonEmptyStringArg(args, 'query');
+    if (queryArg.error) return queryArg.error;
     try {
-      const response = await fetch('http://159.65.221.69:8080/query', {
+      // Knowledge base endpoint — configurable via chrome.storage.local['knowledge_base_url']
+    const stored = await new Promise(r => {
+      try { chrome.storage.local.get(['knowledge_base_url'], r); } catch (_) { r({}); }
+    });
+    const kbUrl = (stored && stored.knowledge_base_url) || 'http://localhost:8080/query';
+    const response = await fetch(kbUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          query: args.query,
+          query: queryArg.value,
           limit: args.limit || 5,
           domain_filter: args.domain || undefined,
           category_filter: args.category || undefined,
@@ -1086,6 +1229,46 @@
     } catch (e) {
       return { error: 'Knowledge base unavailable: ' + e.message };
     }
+  }
+
+  async function readPage(args) {
+    const generator = window.__generateAccessibilityTree;
+    if (typeof generator !== 'function') {
+      return { error: 'Accessibility tree generator is unavailable. Ensure accessibility-tree.js is loaded.' };
+    }
+
+    const params = args || {};
+    return generator(params.filter, params.depth, params.max_chars, params.ref_id);
+  }
+
+  // =========================================================================
+  // Console Capture Reader
+  // =========================================================================
+  function readConsole(args) {
+    const onlyErrors = args.onlyErrors === true;
+    const limit = typeof args.limit === 'number' ? args.limit : 50;
+    const clear = args.clear === true;
+    const pattern = args.pattern || null;
+
+    let messages = _consoleBuffer.slice();
+    const total = messages.length;
+
+    if (onlyErrors) {
+      messages = messages.filter(m => m.level === 'error');
+    }
+
+    if (pattern) {
+      messages = messages.filter(m => m.message.includes(pattern));
+    }
+
+    const filtered = messages.length;
+    messages = messages.slice(-limit);
+
+    if (clear) {
+      _consoleBuffer.length = 0;
+    }
+
+    return { success: true, result: { messages, total, filtered } };
   }
 
   // =========================================================================
@@ -1118,6 +1301,17 @@
       case 'write_observation':  return writeObservation(args);
       case 'read_commands':      return readCommands();
       case 'query_knowledge':    return queryKnowledge(args);
+      case 'read_page':          return readPage(args);
+      case 'read_console':       return readConsole(args);
+      case 'click_ref':          return clickRef(args);
+      case 'type_ref':           return typeRef(args);
+      case 'scroll_to_ref':      return scrollToRef(args);
+      case 'distill_dom':        return distillDom(args);
+      case 'get_dom_changes':    return getDomChanges(args);
+      case 'set_of_marks':       return setOfMarks(args);
+      case 'click_mark':         return clickMark(args);
+      case 'quick':              return executeQuickCommands(args);
+      case 'audit_ui':           return window.__floydUiGate ? window.__floydUiGate.audit() : { error: 'UI Gate not loaded' };
       default:
         return { error: 'Unknown tool: ' + name };
     }
@@ -1128,16 +1322,16 @@
   // =========================================================================
   let mutationTimeout = null;
   let lastMutationEmit = Date.now();
-  
+
   const mutationObserver = new MutationObserver((mutations) => {
     if (mutationTimeout) clearTimeout(mutationTimeout);
-    
+
     const now = Date.now();
     const timeSinceLastEmit = now - lastMutationEmit;
-    
+
     // Fire immediately if it's been more than 3 seconds since the last update
     const delay = timeSinceLastEmit > 3000 ? 0 : 1000;
-    
+
     mutationTimeout = setTimeout(() => {
       lastMutationEmit = Date.now();
       const snapshot = domSnapshot();
@@ -1211,7 +1405,7 @@
   function toggleVisionOverlay() {
     const overlayId = 'tom-vision-overlay-container';
     const existing = document.getElementById(overlayId);
-    
+
     if (existing) {
       existing.remove();
       return;
@@ -1220,53 +1414,53 @@
     const container = document.createElement('div');
     container.id = overlayId;
     container.style.cssText = 'position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:2147483647;';
-    
+
     // Target all interactive elements
     const interactiveSel = 'a[href], button, input, select, textarea, [role="button"], [role="link"], [tabindex]';
     const els = safeQueryAll(interactiveSel);
-    
+
     els.forEach(el => {
       if (!isVisible(el)) return;
-      
+
       const rect = el.getBoundingClientRect();
       const box = document.createElement('div');
-      
+
       // Neon green bounding box
       box.style.cssText = `
-        position:absolute; 
-        border:2px dashed #00ff88; 
-        background:rgba(0,255,136,0.1); 
-        top:${rect.top + window.scrollY}px; 
-        left:${rect.left + window.scrollX}px; 
-        width:${rect.width}px; 
-        height:${rect.height}px; 
+        position:absolute;
+        border:2px dashed #00ff88;
+        background:rgba(0,255,136,0.1);
+        top:${rect.top + window.scrollY}px;
+        left:${rect.left + window.scrollX}px;
+        width:${rect.width}px;
+        height:${rect.height}px;
         pointer-events:none;
         box-sizing:border-box;
       `;
-      
+
       // CSS Selector Label
       const label = document.createElement('div');
       label.textContent = selectorOf(el).substring(0, 40);
       label.style.cssText = `
-        position:absolute; 
-        top:-18px; 
-        left:-2px; 
-        background:#0a0a0a; 
-        color:#00ff88; 
-        font-family:monospace; 
-        font-size:11px; 
+        position:absolute;
+        top:-18px;
+        left:-2px;
+        background:#0a0a0a;
+        color:#00ff88;
+        font-family:monospace;
+        font-size:11px;
         font-weight:bold;
-        padding:2px 6px; 
-        white-space:nowrap; 
+        padding:2px 6px;
+        white-space:nowrap;
         border:1px solid #00ff88;
         border-radius:3px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.5);
       `;
-      
+
       box.appendChild(label);
       container.appendChild(box);
     });
-    
+
     document.body.appendChild(container);
   }
 
